@@ -220,6 +220,11 @@ export class OfficeRuntimeService {
   }
 
   private async initialize(): Promise<void> {
+    // P0-1 startup order: DB → store hydrate → commit recovery → session
+    // rehydrate. Without hydration every persisted artifactRef resolves to
+    // nothing after a process restart.
+    await this.store.hydrate();
+
     if (!this.options.engineDisabled) {
       this.engineAvailable = await this.officecli
         .version_()
@@ -296,10 +301,16 @@ export class OfficeRuntimeService {
   // ---- Sessions (§12–§13) ----
 
   async openSession(artifactRef: ArtifactRef): Promise<DocumentSession> {
-    const session = await this.sessions.open(artifactRef);
-    // §73/§77: external mutation detection starts watching the source.
-    this.watcher.watchFile(this.store.resolvePath(artifactRef));
-    return session;
+    // P1-high: install the watcher BEFORE open — the background strong hash
+    // starts inside open(), and a mutation in that gap must not be missed.
+    const sourcePath = this.store.resolvePath(artifactRef);
+    this.watcher.watchFile(sourcePath);
+    try {
+      return await this.sessions.open(artifactRef);
+    } catch (error) {
+      this.watcher.unwatchFile(sourcePath);
+      throw error;
+    }
   }
 
   getSession(sessionId: string): DocumentSession | undefined {

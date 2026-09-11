@@ -81,6 +81,15 @@ describe("SourceWatcher multi-document (P0-3)", () => {
     await ws.plugin.closeSession(sessionTwo.sessionId);
   }, 30_000);
 
+  it("P1-high: watcher counts track open/close lifecycle", async () => {
+    const ref = await ws.plugin.registerArtifact(fileA);
+    const before = ws.plugin.service.watcher.watchedFileCount();
+    const session = await ws.plugin.openSession(ref);
+    expect(ws.plugin.service.watcher.watchedFileCount()).toBe(before + 1);
+    await ws.plugin.closeSession(session.sessionId);
+    expect(ws.plugin.service.watcher.watchedFileCount()).toBe(before);
+  });
+
   it("unwatch on close: later mutations do not resurrect conflict state", async () => {
     const ref = await ws.plugin.registerArtifact(fileA);
     const session = await ws.plugin.openSession(ref);

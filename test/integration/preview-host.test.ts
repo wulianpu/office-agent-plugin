@@ -25,17 +25,6 @@ let base: string;
 let pptxRef: string;
 let xlsxRef: string;
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-  ws = await openWorkspace();
-  const pptx = await fixture.pptx(ws.root, "host.pptx");
-  pptxRef = await ws.plugin.registerArtifact(pptx);
-  const xlsx = await fixture.xlsx(ws.root, "host.xlsx");
-  xlsxRef = await ws.plugin.registerArtifact(xlsx);
-  host = new PreviewHost(ws.plugin);
-  const port = await host.start();
-  base = `http://127.0.0.1:${port}`;
-});
 
 afterAll(async () => {
   await host?.stop().catch(() => undefined);
@@ -43,6 +32,17 @@ afterAll(async () => {
 });
 
 describe.skipIf(!engineUp)("localhost preview host", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+    ws = await openWorkspace();
+    const pptx = await fixture.pptx(ws.root, "host.pptx");
+    pptxRef = await ws.plugin.registerArtifact(pptx);
+    const xlsx = await fixture.xlsx(ws.root, "host.xlsx");
+    xlsxRef = await ws.plugin.registerArtifact(xlsx);
+    host = new PreviewHost(ws.plugin);
+    const port = await host.start();
+    base = `http://127.0.0.1:${port}`;
+  });
   it("serves the gallery page", async () => {
     const res = await fetch(base + "/");
     expect(res.status).toBe(200);

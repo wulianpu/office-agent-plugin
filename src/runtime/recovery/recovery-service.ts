@@ -6,7 +6,7 @@
  */
 
 import type { RecoveryOutcome } from "../../contracts/revision.js";
-import { sha256File } from "../../support/fsx.js";
+import { canonicalSourceKey, sha256File } from "../../support/fsx.js";
 import type { RuntimeRepositories } from "../persistence/repositories.js";
 import type { RevisionLog } from "../revisions/revision-log.js";
 import type { DurableEventBus } from "../sessions/event-bus.js";
@@ -79,7 +79,7 @@ export class RecoveryService {
         if (!already) {
           this.revisions.commit({
             sessionId: record.sessionId,
-            artifactRef: this.resolveArtifactRef(record.sourcePath),
+            artifactRef: await this.resolveArtifactRef(record.sourcePath),
             contentHash: record.candidateHash,
             origin: record.origin as "human" | "agent" | "external"
           });
@@ -119,16 +119,21 @@ export class RecoveryService {
     return { commitId: record.commitId, resolution: "conflict", reason: `unknown phase ${record.phase}` };
   }
 
-  private resolveArtifactRef(sourcePath: string): string {
+  /**
+   * P0-3: async and STRICT — never falls back to a raw filesystem path as an
+   * ArtifactRef. Registration failure surfaces through the caller.
+   */
+  private async resolveArtifactRef(sourcePath: string): Promise<string> {
     const existing = this.store.tryResolveRefByPath(sourcePath);
     if (existing) return existing;
-    // The source predates this runtime's registration (e.g. recovered DB);
-    // register lazily so the revision keeps a resolvable ref.
     const format = sourcePath.split(".").pop() as "docx" | "xlsx" | "pptx";
-    void this.store
-      .register(sourcePath, { format })
-      .catch(() => undefined);
-    return this.store.tryResolveRefByPath(sourcePath) ?? sourcePath;
+    try {
+      return await this.store.register(sourcePath, { format });
+    } catch {
+      // Registration failed (missing file): opaque canonical key, never the
+      // raw path — resolvePath will surface a clear error if it is used.
+      return canonicalSourceKey(sourcePath);
+    }
   }
 
   private markPhase(commitId: string, phase: "finalized" | "aborted"): void {

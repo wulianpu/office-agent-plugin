@@ -31,16 +31,23 @@ export class ArtifactStore {
 
   static async open(workspaceRoot: string, persistence?: ArtifactStorePersistence): Promise<ArtifactStore> {
     const store = new ArtifactStore(workspaceRoot, persistence);
-    await ensureDir(store.stagingRoot);
-    if (persistence) {
-      for (const row of persistence.loadArtifacts()) {
-        if (!store.byRef.has(row.ref)) {
-          store.byRef.set(row.ref, { ref: row.ref, path: row.path, kind: row.kind, format: row.format });
-          store.byPath.set(row.path, row.ref);
-        }
+    await store.hydrate();
+    return store;
+  }
+
+  /**
+   * P0-1: hydrate from persistence — persisted byPath keys go through
+   * canonicalSourceKey so restart lookups hit the same keys live code uses.
+   */
+  async hydrate(): Promise<void> {
+    await ensureDir(this.stagingRoot);
+    if (!this.persistence) return;
+    for (const row of this.persistence.loadArtifacts()) {
+      if (!this.byRef.has(row.ref)) {
+        this.byRef.set(row.ref, { ref: row.ref, path: row.path, kind: row.kind, format: row.format });
+        this.byPath.set(canonicalSourceKey(row.path), row.ref);
       }
     }
-    return store;
   }
 
   get stagingRoot(): string {

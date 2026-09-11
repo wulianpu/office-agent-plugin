@@ -21,17 +21,17 @@ const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
   .catch(() => false);
 
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-
-  ws = await openWorkspace();
-});
 
 afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
 describe.skipIf(!engineUp)("Candidate safety (§67–§72)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+
+    ws = await openWorkspace();
+  });
   it("INV-08: verification is rejected when hashes do not match the candidate", async () => {
     const pptx = await fixture.pptx(ws.root, "verify.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);

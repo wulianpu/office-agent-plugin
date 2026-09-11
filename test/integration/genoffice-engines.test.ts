@@ -31,16 +31,16 @@ const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
   .catch(() => false);
 
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-  ws = await openWorkspace();
-});
 
 afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
 describe.skipIf(!engineUp)("GenOffice vendor engines (§146)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+    ws = await openWorkspace();
+  });
   it("bundles are loadable (probe)", async () => {
     const probe = await probeVendorEngines();
     expect(probe.pptx).toBe(true);

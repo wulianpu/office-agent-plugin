@@ -222,6 +222,9 @@ export class Scheduler {
     const { job } = queued;
     const staleBefore = this.isStale(job);
     if (staleBefore) {
+      // P0-4: the pump pre-acquired the resource lease for this job — bailing
+      // before try/finally must still release it, or io/render slots drain.
+      preAcquiredLease?.release();
       this.stats.staleDropped++;
       this.stats.completed++;
       this.running--;

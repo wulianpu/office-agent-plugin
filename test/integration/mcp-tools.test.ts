@@ -21,15 +21,6 @@ const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
 let pptxPath: string;
 let sessionId: string;
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-
-  ws = await openWorkspace();
-  pptxPath = await fixture.pptx(ws.root, "mcp.pptx");
-  const ref = await ws.plugin.registerArtifact(pptxPath);
-  const session = await ws.plugin.openSession(ref);
-  sessionId = session.sessionId;
-});
 
 afterAll(async () => {
   await ws?.plugin.closeSession(sessionId).catch(() => undefined);
@@ -37,6 +28,15 @@ afterAll(async () => {
 });
 
 describe.skipIf(!engineUp)("MCP tools (§57–§62, INV-12)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+
+    ws = await openWorkspace();
+    pptxPath = await fixture.pptx(ws.root, "mcp.pptx");
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    sessionId = session.sessionId;
+  });
   it("office.capabilities reports the honest degradation matrix", () => {
     const caps = ws.plugin.mcpTools.capabilities();
     expect(caps.offline).toBe(true);

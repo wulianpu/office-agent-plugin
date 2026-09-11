@@ -84,16 +84,12 @@ export function canonicalSourceKey(path: string): string {
       // Missing file: fall back to the raw path.
     }
   }
-  let key = process.platform === "win32" ? real.toLowerCase() : real;
-  try {
-    const st = statSync(real);
-    if (st.dev !== undefined && st.ino !== undefined && st.ino !== 0) {
-      key += `#f${st.dev.toString(36)}-${st.ino.toString(36)}`;
-    }
-  } catch {
-    // Identity from path alone is acceptable when stat fails.
-  }
-  return key;
+  // P0-2: STABLE identity only — realpath + platform case folding.
+  // dev/inode is deliberately EXCLUDED from long-lived map keys: the atomic
+  // committer's temp-to-rename swap changes the inode on every save, which
+  // would silently invalidate every byPath/lease key after each commit.
+  // File incarnation lives in FileFingerprint for alias/replacement checks.
+  return process.platform === "win32" ? real.toLowerCase() : real;
 }
 
 export async function sha256File(path: string): Promise<string> {

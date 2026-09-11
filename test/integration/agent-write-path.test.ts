@@ -22,18 +22,18 @@ const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
 
 let pptxPath: string;
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-
-  ws = await openWorkspace();
-  pptxPath = await fixture.pptx(ws.root);
-});
 
 afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
 describe.skipIf(!engineUp)("Agent write path (§158)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+
+    ws = await openWorkspace();
+    pptxPath = await fixture.pptx(ws.root);
+  });
   it("runs the full candidate workflow: mutate → flush → verify → accept", async () => {
     const ref = await ws.plugin.registerArtifact(pptxPath);
     const session = await ws.plugin.openSession(ref);

@@ -137,6 +137,20 @@ export class SourceWatcher {
     return () => this.listeners.delete(listener);
   }
 
+  /** Watched-file count (sum of refcounts) — test/telemetry introspection. */
+  watchedFileCount(): number {
+    let total = 0;
+    for (const counts of this.dirs.values()) {
+      for (const n of counts.paths.values()) total += n;
+    }
+    return total;
+  }
+
+  /** Distinct watched directories — OS watcher footprint. */
+  directoryCount(): number {
+    return this.dirs.size;
+  }
+
   dispose(): void {
     for (const entry of this.dirs.values()) entry.watcher.close();
     this.dirs.clear();

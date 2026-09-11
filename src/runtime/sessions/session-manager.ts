@@ -122,11 +122,8 @@ export class SessionManager {
           resources: { io: 1 },
           run: async () => {
             const { stableHashFile } = await import("../../support/fsx.js");
-            for (let attempt = 0; attempt < 3; attempt++) {
-              const result = await stableHashFile(sourcePath);
-              if (result) return result;
-            }
-            return null;
+            // Single retry layer (stableHashFile already retries internally).
+            return stableHashFile(sourcePath);
           }
         })
         .promise;

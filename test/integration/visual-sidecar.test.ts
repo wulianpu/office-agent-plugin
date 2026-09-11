@@ -32,16 +32,16 @@ async function ensureLargeCorpus(): Promise<string> {
   return path;
 }
 
-beforeAll(async () => {
-  fixture = await createOfficeCliFixture();
-  ws = await openWorkspace();
-});
 
 afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
 describe.skipIf(!engineUp)("pptx headless visual rendering (§P7)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+    ws = await openWorkspace();
+  });
   it("previews embed standalone SVG slides containing laid-out text", async () => {
     const pptx = await fixture.pptx(ws.root, "visual.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);
