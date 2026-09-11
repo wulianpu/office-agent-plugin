@@ -6,7 +6,7 @@
  */
 
 import type { RecoveryOutcome } from "../../contracts/revision.js";
-import { canonicalSourceKey, sha256File } from "../../support/fsx.js";
+import { sha256File } from "../../support/fsx.js";
 import type { RuntimeRepositories } from "../persistence/repositories.js";
 import type { RevisionLog } from "../revisions/revision-log.js";
 import type { DurableEventBus } from "../sessions/event-bus.js";
@@ -77,9 +77,22 @@ export class RecoveryService {
           .list(record.sessionId)
           .some((r) => r.contentHash === record.candidateHash);
         if (!already) {
+          let artifactRef: string;
+          try {
+            artifactRef = await this.resolveArtifactRef(record.sourcePath);
+          } catch {
+            // Source is gone / unregistrable — conflict, not a bad revision.
+            this.markPhase(record.commitId, "aborted");
+            await this.emit(record.sessionId, {
+              commitId: record.commitId,
+              resolution: "conflict",
+              reason: "source-unregistrable"
+            });
+            return { commitId: record.commitId, resolution: "conflict", reason: "source-unregistrable" };
+          }
           this.revisions.commit({
             sessionId: record.sessionId,
-            artifactRef: await this.resolveArtifactRef(record.sourcePath),
+            artifactRef,
             contentHash: record.candidateHash,
             origin: record.origin as "human" | "agent" | "external"
           });
@@ -120,20 +133,18 @@ export class RecoveryService {
   }
 
   /**
-   * P0-3: async and STRICT — never falls back to a raw filesystem path as an
-   * ArtifactRef. Registration failure surfaces through the caller.
+   * P0 FAIL CLOSED: if the source cannot be registered (missing file, format
+   * not recognized), recovery reports a conflict — never fabricates an
+   * unresolvable ArtifactRef. The caller (recoverOne) turns the throw into
+   * a conflict outcome.
    */
   private async resolveArtifactRef(sourcePath: string): Promise<string> {
     const existing = this.store.tryResolveRefByPath(sourcePath);
     if (existing) return existing;
     const format = sourcePath.split(".").pop() as "docx" | "xlsx" | "pptx";
-    try {
-      return await this.store.register(sourcePath, { format });
-    } catch {
-      // Registration failed (missing file): opaque canonical key, never the
-      // raw path — resolvePath will surface a clear error if it is used.
-      return canonicalSourceKey(sourcePath);
-    }
+    // No catch: register throws on missing file / unknown format, and the
+    // revision must never carry a ref the store cannot resolve.
+    return await this.store.register(sourcePath, { format });
   }
 
   private markPhase(commitId: string, phase: "finalized" | "aborted"): void {

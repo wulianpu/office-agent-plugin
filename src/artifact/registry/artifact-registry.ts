@@ -84,9 +84,7 @@ export class ArtifactRegistry implements IArtifactRegistry {
           signal: abort.signal
         })
         .then((context) => {
-          if (this.completed.admit(CONTEXT_BYTES_ESTIMATE)) {
-            this.completed.set(key, context);
-          }
+          this.completed.set(key, context);
           this.inFlight.delete(key);
           return context;
         })
@@ -170,19 +168,16 @@ export class ArtifactRegistry implements IArtifactRegistry {
     const context = this.completed.get(fromKey);
     if (!context) return false;
     const toKey = contextKey(to.artifactRef, to.fingerprintKey, to.profile ?? from.profile);
-    // P1-high-A: REBIND, never alias. A new identity wrapper carries the
-    // SOURCE artifactRef (consumers resolvePath(context.artifactRef)); the
-    // underlying parsed engine model inside `enrichment` stays shared, so
-    // promotion still costs zero reparse. The wrapper itself is cheap — the
-    // heavy bytes were billed once under the original key.
+    // P1-high: MOVE (rekey) the candidate entry under the source key — the
+    // parsed engine model moves with it, billed ONCE under the new key.
     const rebound: ArtifactContext = {
       ...context,
       artifactRef: to.artifactRef,
       version: { ...context.version, artifactRef: to.artifactRef },
-      lastAccessAt: Date.now(),
-      estimatedResidentBytes: 4_096
+      lastAccessAt: Date.now()
     };
-    if (this.completed.admit(4_096)) {
+    this.completed.delete(fromKey);
+    if (this.completed.admit(this.completed.sizeEstimateOf(rebound))) {
       this.completed.set(toKey, rebound);
     }
     return true;

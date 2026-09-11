@@ -94,7 +94,7 @@ export class ResourceGovernor implements IResourceGovernor {
       const budgetKey = CONCURRENT_CLASSES[key];
       if (budgetKey) {
         const counter = this.counters.get(key)!;
-        if (counter.used + 1 > (this.budgets[budgetKey] as number)) return undefined;
+        if (counter.used + amount > (this.budgets[budgetKey] as number)) return undefined;
       }
     }
     const leaseId = `gov-${this.nextLeaseId++}`;
@@ -103,8 +103,9 @@ export class ResourceGovernor implements IResourceGovernor {
       const key = cls as ResourceClass;
       const counter = this.counters.get(key);
       if (counter) {
-        counter.used += key === "memory" ? 0 : 1;
-        if (request.protected) counter.protected += key === "memory" ? 0 : 1;
+        const delta = key === "memory" ? 0 : amount;
+        counter.used += delta;
+        if (request.protected) counter.protected += delta;
       }
     }
     const bytes = request.bytes ?? 0;
@@ -136,8 +137,9 @@ export class ResourceGovernor implements IResourceGovernor {
       const key = cls as ResourceClass;
       const counter = this.counters.get(key);
       if (counter) {
-        counter.used = Math.max(0, counter.used - (key === "memory" ? 0 : 1));
-        if (request.protected) counter.protected = Math.max(0, counter.protected - (key === "memory" ? 0 : 1));
+        const delta = key === "memory" ? 0 : amount;
+        counter.used = Math.max(0, counter.used - delta);
+        if (request.protected) counter.protected = Math.max(0, counter.protected - delta);
       }
     }
     const bytes = request.bytes ?? 0;

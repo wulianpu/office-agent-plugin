@@ -37,7 +37,10 @@ export class SessionActor {
 export class SessionManager {
   private readonly sessions = new Map<SessionId, { session: DocumentSession; actor: SessionActor; readiness: WriteReadinessState }>();
   /** Background strong-identity promises per session (P0-6 §52). */
-  private readonly strongIdentity = new Map<SessionId, Promise<CommittedRevision>>();
+  private readonly strongIdentity = new Map<SessionId, {
+    promise: Promise<CommittedRevision>;
+    cancel: () => void;
+  }>();
   /** P0-B: conflict watcher — installed by the service BEFORE open() so the
    *  background hash never races a missed filesystem event. */
   onSourceMutated?: (sourcePath: string, kind: "self-write" | "external") => void;
@@ -165,9 +168,13 @@ export class SessionManager {
       }
       return revision;
     })();
-    this.strongIdentity.set(sessionId, strong);
-    // A failed background hash surfaces on the next ensureStrongIdentity call.
-    strong.catch(() => undefined);
+    const cancelSignal = new AbortController();
+    const cancellable = strong.then((revision) => {
+      if (cancelSignal.signal.aborted) throw new DOMException("cancelled", "AbortError");
+      return revision;
+    });
+    this.strongIdentity.set(sessionId, { promise: cancellable, cancel: () => cancelSignal.abort() });
+    cancellable.catch(() => undefined);
 
     await this.events.emit(sessionId, 1, "session.opened", {
       documentId,
@@ -197,7 +204,7 @@ export class SessionManager {
    */
   async ensureStrongIdentity(sessionId: SessionId): Promise<CommittedRevision> {
     const pending = this.strongIdentity.get(sessionId);
-    if (pending) return pending;
+    if (pending) return pending.promise;
     const session = this.require(sessionId);
     if (session.committedRevision.contentHash) return session.committedRevision;
     throw new OfficeRuntimeError("recovery-required", `session ${sessionId} has no strong identity`);
@@ -269,6 +276,7 @@ export class SessionManager {
         await this.events.emit(sessionId, entry.session.sessionEpoch, "session.closed", {});
       })
       .catch(() => undefined);
+    this.strongIdentity.get(sessionId)?.cancel();
     this.strongIdentity.delete(sessionId);
   }
 

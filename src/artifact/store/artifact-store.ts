@@ -44,8 +44,7 @@ export class ArtifactStore {
     if (!this.persistence) return;
     for (const row of this.persistence.loadArtifacts()) {
       if (!this.byRef.has(row.ref)) {
-        this.byRef.set(row.ref, { ref: row.ref, path: row.path, kind: row.kind, format: row.format });
-        this.byPath.set(canonicalSourceKey(row.path), row.ref);
+        await this.bindArtifact(row);
       }
     }
   }
@@ -68,9 +67,7 @@ export class ArtifactStore {
     if (existing) return existing;
 
     const ref = newArtifactRef();
-    this.byRef.set(ref, { ref, path: abs, kind: "source", format });
-    this.byPath.set(canonicalSourceKey(abs), ref);
-    await this.persistence?.saveArtifact({ ref, path: abs, kind: "source", format });
+    await this.bindArtifact({ ref, path: abs, kind: "source", format });
     return ref;
   }
 
@@ -110,14 +107,18 @@ export class ArtifactStore {
     const stagingPath = this.stagingPathFor(stagingRef, this.formatOf(sourceRef));
     await ensureDir(this.stagingRoot);
     await cloneFile(sourcePath, stagingPath);
-    this.byRef.set(stagingRef, { ref: stagingRef, path: stagingPath, kind: "staging", format: this.formatOf(sourceRef) });
-    await this.persistence?.saveArtifact({
-      ref: stagingRef,
-      path: stagingPath,
-      kind: "staging",
-      format: this.formatOf(sourceRef)
-    });
+    await this.bindArtifact({ ref: stagingRef, path: stagingPath, kind: "staging", format: this.formatOf(sourceRef) });
     return stagingRef;
+  }
+
+  /**
+   * P1-high: SINGLE registration point — every source/staging binding goes
+   * through byRef + byPath (canonical) + persistence together.
+   */
+  private async bindArtifact(artifact: StoredArtifact): Promise<void> {
+    this.byRef.set(artifact.ref, artifact);
+    this.byPath.set(canonicalSourceKey(artifact.path), artifact.ref);
+    await this.persistence?.saveArtifact(artifact);
   }
 
   /** Register a staging file that already exists (e.g. produced by OfficeCLI create). */
@@ -126,9 +127,7 @@ export class ArtifactStore {
     const existing = this.byPath.get(canonicalSourceKey(abs));
     if (existing) return existing;
     const ref = newArtifactRef();
-    this.byRef.set(ref, { ref, path: abs, kind: "staging", format });
-    this.byPath.set(canonicalSourceKey(abs), ref);
-    await this.persistence?.saveArtifact({ ref, path: abs, kind: "staging", format });
+    await this.bindArtifact({ ref, path: abs, kind: "staging", format });
     return ref;
   }
 
@@ -171,7 +170,7 @@ export class ArtifactStore {
     let removed = 0;
     await mkdir(this.stagingRoot, { recursive: true });
     for (const name of await readdir(this.stagingRoot)) {
-      const ref = this.byPath.get(join(this.stagingRoot, name));
+      const ref = this.byPath.get(canonicalSourceKey(join(this.stagingRoot, name)));
       if (ref && keep.has(ref)) continue;
       await removeQuiet(join(this.stagingRoot, name));
       if (ref) {
