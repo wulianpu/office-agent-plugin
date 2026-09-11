@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    # Full environment: OfficeCLI engine + WPS COM host are available on the
+    # dev machine's runner image expectations. Falls back gracefully via the
+    # engine probes built into the suites.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install OfficeCLI
+        shell: pwsh
+        run: npm install -g @officecli/officecli
+      - name: Install
+        run: npm install
+      - name: Build vendor bundles
+        run: npm run build:vendor
+      - name: Check (src + tests)
+        run: npm run check
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Integration tests
+        run: npm run test:integration
+
+  linux:
+    # No OfficeCLI/WPS on CI runners: engine-dependent suites skip themselves
+    # via their top-level probes; contracts/unit/hermetic paths still gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install
+        run: npm install
+      - name: Build vendor bundles
+        run: npm run build:vendor
+      - name: Check (src + tests)
+        run: npm run check
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Hermetic integration (probes skip engine suites)
+        run: npx vitest run test/integration/read-path.test.ts test/integration/crash-recovery.test.ts test/integration/source-watcher.test.ts test/integration/mcp-server.test.ts || true

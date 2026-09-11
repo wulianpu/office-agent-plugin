@@ -87,20 +87,31 @@ describe("GenOffice vendor engines (§146)", () => {
 });
 
 describe("GenOffice-backed runtime paths", () => {
-  it("preview outlines come from the GenOffice engine model", async () => {
+  it("P0-7: default previews stay light (ZIP/index, no full engine parse)", async () => {
     const pptx = await fixture.pptx(ws.root, "prev.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);
     const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible" });
-    expect(result.model.cacheKey.rendererVersion).toBe("genoffice-1");
+    expect(result.model.cacheKey.rendererVersion).toBe("basic-1"); // metadata profile
+    expect(result.model.svgSlides).toBeUndefined(); // no engine model attached
     const outline = result.model.outline as { kind: "pptx"; slides: Array<{ shapes: Array<{ text?: string }> }> };
     expect(outline.slides.length).toBeGreaterThan(0);
     expect(outline.slides[0]?.shapes.some((s) => (s.text ?? "").includes("Original"))).toBe(true);
   });
 
-  it("docx previews use engine blocks", async () => {
+  it("P0-7: visual previews upgrade to the GenOffice engine model + SVG", async () => {
+    const pptx = await fixture.pptx(ws.root, "prev-visual.pptx");
+    const ref = await ws.plugin.registerArtifact(pptx);
+    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible", visual: true });
+    expect(result.model.cacheKey.rendererVersion).toBe("genoffice-1");
+    expect(result.model.svgSlides?.length).toBeGreaterThan(0);
+    const outline = result.model.outline as { kind: "pptx"; slides: Array<{ shapes: Array<{ text?: string }> }> };
+    expect(outline.slides[0]?.shapes.some((s) => (s.text ?? "").includes("Original"))).toBe(true);
+  });
+
+  it("docx visual previews use engine blocks", async () => {
     const docx = await fixture.docx(ws.root, "prev.docx");
     const ref = await ws.plugin.registerArtifact(docx);
-    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible" });
+    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible", visual: true });
     expect(result.model.cacheKey.rendererVersion).toBe("genoffice-1");
     expect(result.model.outline.kind).toBe("docx");
   });

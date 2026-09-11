@@ -45,7 +45,9 @@ export class GenOfficePptxFormatRuntime implements FormatRuntime {
     const path = this.pathResolver(input.artifactRef);
     const fingerprint = await fileFingerprint(path);
     if (input.signal?.aborted) throw new DOMException("aborted", "AbortError");
-    const bytes = new Uint8Array(await this.readFile(path));
+    // Zero-copy: wrap the read buffer's ArrayBuffer (no duplicate payload in memory).
+    const buffer = await this.readFile(path);
+    const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const opened = await openPptx(bytes);
     if (opened.deck.slides.length === 0) {
       // Engine parsed but found nothing (e.g. minimal/nonstandard packages):
@@ -59,8 +61,11 @@ export class GenOfficePptxFormatRuntime implements FormatRuntime {
       version: { artifactRef: input.artifactRef, fingerprint },
       format: "pptx",
       consistency: input.consistency,
+      profile: "full",
       rendererVersion: GENOFFICE_RENDERER_VERSION,
       lastAccessAt: Date.now(),
+      // §101 honesty: deck elements are the resident cost, not a flat 8KB.
+      estimatedResidentBytes: estimateDeckBytes(opened.deck, buffer.byteLength),
       enrichment: new Map<string, unknown>([
         ["engine", "genoffice"],
         ["slideCount", opened.deck.slides.length],
@@ -95,6 +100,24 @@ export class GenOfficePptxFormatRuntime implements FormatRuntime {
   }
 }
 
+/**
+ * §101 honest resident estimates for engine read models. Element/block
+ * records dominate; slide XML strings in the deck add the rest. These are
+ * estimates (not exact heap walks) but within the right order of magnitude,
+ * unlike the flat 8KB default.
+ */
+function estimateDeckBytes(deck: PptxDeck, sourceBytes: number): number {
+  let elements = 0;
+  for (const slide of deck.slides) elements += slide.elements.length;
+  // ~1.2KB per element record (geometry + text body) + raw XML retained.
+  return elements * 1_200 + sourceBytes * 0.35 + 65_536;
+}
+
+function estimateDocBytes(parsed: ParsedDocx, sourceBytes: number): number {
+  // ~0.6KB per block (text + props); XML strings retained for patching.
+  return parsed.blocks.length * 600 + sourceBytes * 0.5 + 65_536;
+}
+
 export class GenOfficeDocxFormatRuntime implements FormatRuntime {
   readonly format = "docx" as const;
   /** §127: degraded fallback when the engine cannot make sense of the bytes. */
@@ -115,7 +138,9 @@ export class GenOfficeDocxFormatRuntime implements FormatRuntime {
     const path = this.pathResolver(input.artifactRef);
     const fingerprint = await fileFingerprint(path);
     if (input.signal?.aborted) throw new DOMException("aborted", "AbortError");
-    const bytes = new Uint8Array(await this.readFile(path));
+    // Zero-copy: wrap the read buffer's ArrayBuffer (no duplicate payload in memory).
+    const buffer = await this.readFile(path);
+    const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const parsed = await parseDocx(bytes);
     if (parsed.blocks.length === 0) {
       throw new Error("engine produced no blocks");
@@ -127,8 +152,10 @@ export class GenOfficeDocxFormatRuntime implements FormatRuntime {
       version: { artifactRef: input.artifactRef, fingerprint },
       format: "docx",
       consistency: input.consistency,
+      profile: "full",
       rendererVersion: GENOFFICE_RENDERER_VERSION,
       lastAccessAt: Date.now(),
+      estimatedResidentBytes: estimateDocBytes(parsed, buffer.byteLength),
       enrichment: new Map<string, unknown>([
         ["engine", "genoffice"],
         ["blockCount", parsed.blocks.length]

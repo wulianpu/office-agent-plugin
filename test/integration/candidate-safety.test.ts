@@ -132,11 +132,16 @@ describe("Candidate safety (§67–§72)", () => {
     await ws.plugin.verifyAgentCandidate(task);
     await ws.plugin.finalizeAgentTask(task);
 
-    await ws.plugin.acceptCandidate(session.sessionId, task.candidateId);
+    const accepted = await ws.plugin.acceptCandidate(session.sessionId, task.candidateId);
     const journal = ws.plugin.service.repos.listJournal();
     const last = journal[journal.length - 1]!;
     expect(last.phase).toBe("finalized");
     expect(await sha256File(pptx)).toBe(last.candidateHash);
+    // P0-1: the DB-persisted revision must carry the real artifactRef (not a
+    // post-hoc patched JS object) so crash recovery resolves the artifact.
+    const persisted = ws.plugin.service.repos.getRevision(accepted.revisionId);
+    expect(persisted?.artifactRef).toBe(ref);
+    expect(persisted?.artifactRef).not.toBe("");
     await ws.plugin.closeSession(session.sessionId);
   });
 });

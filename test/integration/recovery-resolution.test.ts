@@ -36,6 +36,9 @@ describe("recovery resolution (§77)", () => {
     const session = await ws.plugin.openSession(ref);
     const sessionId = session.sessionId;
 
+    // Let the background strong identity bind first (rehydrated sessions in
+    // practice always carry persisted, already-strong revisions).
+    await ws.plugin.service.sessions.ensureStrongIdentity(sessionId);
     // Simulate the crash-recovery rehydration path: lifecycle → recovery-required.
     ws.plugin.service.sessions.updateSession(sessionId, (s) => {
       s.lifecycle = "recovery-required";
@@ -53,7 +56,9 @@ describe("recovery resolution (§77)", () => {
     const session = await ws.plugin.openSession(ref);
     const sessionId = session.sessionId;
 
-    // External bytes appear before resolution.
+    // Bind strong identity on the ORIGINAL bytes first; external bytes then
+    // appear before resolution (the divergence resolution must detect).
+    await ws.plugin.service.sessions.ensureStrongIdentity(sessionId);
     const handle = await appendFile(docxPath, "x");
     void handle;
     ws.plugin.service.sessions.updateSession(sessionId, (s) => {
@@ -76,42 +81,72 @@ describe("recovery resolution (§77)", () => {
 });
 
 describe("concurrent commit safety (P11, INV-10/11)", () => {
-  it("concurrent accepts on the same source file: exactly one wins", async () => {
+  it("P0-4: a second session's writer on the same document is rejected at acquire", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
-    // Two independent sessions on the same artifact.
     const sessionA = await ws.plugin.openSession(ref);
     const sessionB = await ws.plugin.openSession(ref);
 
     const taskA = await ws.plugin.beginAgentTask(sessionA.sessionId, {
+      intent: "writer A",
+      destructiveAllowed: false
+    });
+    // Document-scoped single writer: session B cannot acquire while A holds.
+    await expect(
+      ws.plugin.beginAgentTask(sessionB.sessionId, { intent: "writer B", destructiveAllowed: false })
+    ).rejects.toMatchObject({ code: "lease-held" });
+    // Human promotion is equally blocked.
+    await expect(ws.plugin.beginEdit(sessionB.sessionId)).rejects.toMatchObject({ code: "lease-held" });
+
+    // Release A; B may now acquire.
+    await ws.plugin.finalizeAgentTask(taskA);
+    await ws.plugin.rejectCandidate(sessionA.sessionId);
+    const taskB = await ws.plugin.beginAgentTask(sessionB.sessionId, {
+      intent: "writer B",
+      destructiveAllowed: false
+    });
+    await ws.plugin.finalizeAgentTask(taskB);
+    await ws.plugin.rejectCandidate(sessionB.sessionId);
+    await ws.plugin.closeSession(sessionA.sessionId);
+    await ws.plugin.closeSession(sessionB.sessionId);
+  });
+
+  it("serialized accepts on the same source file: exactly one wins", async () => {
+    const ref = await ws.plugin.registerArtifact(docxPath);
+    const sessionA = await ws.plugin.openSession(ref);
+    const sessionB = await ws.plugin.openSession(ref);
+
+    // Sequential tasks (document-scoped single writer forces ordering);
+    // both candidates base on the same bytes with DIFFERENT mutations.
+    const taskA = await ws.plugin.beginAgentTask(sessionA.sessionId, {
       intent: "concurrent A",
       destructiveAllowed: false
     });
-    const taskB = await ws.plugin.beginAgentTask(sessionB.sessionId, {
-      intent: "concurrent B",
-      destructiveAllowed: false
-    });
-    // Both candidates base on the same bytes but carry DIFFERENT mutations —
-    // only one can survive a replace.
     await ws.plugin.executeAgentMutation(taskA, {
       commandId: "cmd-cc-a",
       idempotencyKey: "cc-a",
       payload: [{ command: "set", path: "/body/paragraph[1]", props: { text: "Variant A" } }]
+    });
+    await ws.plugin.flushAgentCandidate(taskA);
+    await ws.plugin.verifyAgentCandidate(taskA);
+    await ws.plugin.finalizeAgentTask(taskA);
+
+    const taskB = await ws.plugin.beginAgentTask(sessionB.sessionId, {
+      intent: "concurrent B",
+      destructiveAllowed: false
     });
     await ws.plugin.executeAgentMutation(taskB, {
       commandId: "cmd-cc-b",
       idempotencyKey: "cc-b",
       payload: [{ command: "set", path: "/body/paragraph[1]", props: { text: "Variant B" } }]
     });
-    for (const task of [taskA, taskB]) {
-      await ws.plugin.flushAgentCandidate(task);
-      await ws.plugin.verifyAgentCandidate(task);
-      await ws.plugin.finalizeAgentTask(task);
-    }
+    await ws.plugin.flushAgentCandidate(taskB);
+    await ws.plugin.verifyAgentCandidate(taskB);
+    await ws.plugin.finalizeAgentTask(taskB);
     // Snapshot hashes BEFORE accepting (the winner's candidate row is deleted on accept).
     const hashA = ws.plugin.service.candidates.require(taskA.candidateId).currentHash!;
     const hashB = ws.plugin.service.candidates.require(taskB.candidateId).currentHash!;
 
-    // Fire both accepts concurrently — serialization must let exactly one land.
+    // Fire both accepts concurrently — per-path serialization lets exactly one land.
     const results = await Promise.allSettled([
       ws.plugin.acceptCandidate(sessionA.sessionId, taskA.candidateId),
       ws.plugin.acceptCandidate(sessionB.sessionId, taskB.candidateId)

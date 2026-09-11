@@ -20,6 +20,15 @@ afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
+async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return condition();
+}
+
 describe("Human edit path (§12–§13)", () => {
   it("promotes a read-only session to an editor on first mutation", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
@@ -39,6 +48,7 @@ describe("Human edit path (§12–§13)", () => {
     await ws.plugin.rejectCandidate(session.sessionId);
 
     // With the candidate cleared, promotion succeeds with a human lease.
+    const leaseCountBefore = ws.plugin.service.registry.leaseCount();
     const { lease, editor } = await ws.plugin.beginEdit(session.sessionId, {
       location: { block: 1 }
     });
@@ -52,23 +62,32 @@ describe("Human edit path (§12–§13)", () => {
 
     await ws.plugin.endEdit(session.sessionId);
     expect(ws.plugin.service.leases.activeLease(session.sessionId)).toBeUndefined();
+    // P0-2: the editor's ArtifactLease must be released with the editor —
+    // registry lease count returns to its pre-edit baseline.
+    expect(ws.plugin.service.registry.leaseCount()).toBe(leaseCountBefore);
     await ws.plugin.closeSession(session.sessionId);
   });
 
-  it("external mutation during promotion marks the session conflicting (§13)", async () => {
+  it("external mutation during promotion marks the session conflicting (§13, §73)", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
     const session = await ws.plugin.openSession(ref);
     // Mutate the source underneath before promotion.
     const { appendFile } = await import("node:fs/promises");
     const handle = await appendFile(docxPath, "x");
     void handle;
+    // The §73 watcher flags the session conflicted (debounced), which gates
+    // promotion; the hash-race window itself is covered by the strong-hash
+    // comparison when the watcher loses the race.
+    const conflicted = await waitFor(
+      () => ws.plugin.service.getSession(session.sessionId)?.lifecycle === "conflict"
+    );
+    expect(conflicted).toBe(true);
     await expect(ws.plugin.beginEdit(session.sessionId)).rejects.toMatchObject({
-      code: "source-mutated"
+      code: "recovery-required"
     });
-    expect(ws.plugin.service.getSession(session.sessionId)?.lifecycle).toBe("conflict");
     void sha256File;
     await ws.plugin.closeSession(session.sessionId);
-  });
+  }, 20_000);
 
   it("the editor contract lifecycle holds (mount/save/suspend/resume/dispose)", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);

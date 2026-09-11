@@ -29,8 +29,11 @@ describe("Agent write path (§158)", () => {
   it("runs the full candidate workflow: mutate → flush → verify → accept", async () => {
     const ref = await ws.plugin.registerArtifact(pptxPath);
     const session = await ws.plugin.openSession(ref);
+    // P0-6: open returns immediately (optimistic identity); writer paths
+    // observe the strong revision via ensureStrongIdentity.
+    const strong = await ws.plugin.service.sessions.ensureStrongIdentity(session.sessionId);
     const sourceHashBefore = await sha256File(pptxPath);
-    expect(session.committedRevision.contentHash).toBe(sourceHashBefore);
+    expect(strong.contentHash).toBe(sourceHashBefore);
 
     const task = await ws.plugin.beginAgentTask(session.sessionId, {
       intent: "retitle slide 1",
@@ -82,6 +85,44 @@ describe("Agent write path (§158)", () => {
     const updated = ws.plugin.service.getSession(session.sessionId)!;
     expect(updated.committedRevision.sequence).toBe(2);
     expect(updated.committedRevision.origin).toBe("agent");
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
+  it("P1d: idempotency is candidate-scoped; same key + different payload conflicts (§61)", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+
+    // Task 1 uses the key with payload A.
+    const task1 = await ws.plugin.beginAgentTask(session.sessionId, { intent: "t1", destructiveAllowed: false });
+    await ws.plugin.executeAgentMutation(task1, {
+      commandId: "cmd-a",
+      idempotencyKey: "shared-key",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Payload A" } }]
+    });
+
+    // Same key + DIFFERENT payload inside the same candidate → conflict.
+    await expect(
+      ws.plugin.executeAgentMutation(task1, {
+        commandId: "cmd-b",
+        idempotencyKey: "shared-key",
+        payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Payload B" } }]
+      })
+    ).rejects.toMatchObject({ code: "idempotency-conflict" });
+
+    await ws.plugin.finalizeAgentTask(task1);
+    await ws.plugin.rejectCandidate(session.sessionId);
+
+    // Task 2 (new candidate) MAY reuse the key — scope is per candidate.
+    const task2 = await ws.plugin.beginAgentTask(session.sessionId, { intent: "t2", destructiveAllowed: false });
+    await expect(
+      ws.plugin.executeAgentMutation(task2, {
+        commandId: "cmd-c",
+        idempotencyKey: "shared-key",
+        payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Payload C" } }]
+      })
+    ).resolves.toBeTruthy();
+    await ws.plugin.finalizeAgentTask(task2);
+    await ws.plugin.rejectCandidate(session.sessionId);
     await ws.plugin.closeSession(session.sessionId);
   });
 

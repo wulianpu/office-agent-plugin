@@ -107,7 +107,7 @@ export class PreviewService {
     const path = this.store.resolvePath(request.artifactRef);
 
     const before = await fileFingerprint(path);
-    const cacheKeyString = previewCacheKeyString(request.artifactRef, fingerprintKey(before));
+    const cacheKeyString = previewCacheKeyString(request.artifactRef, fingerprintKey(before), request.visual);
     const cached = this.cache.get(cacheKeyString);
     if (cached) {
       return { requestId: request.requestId, model: cached, retried: false, elapsedMs: Date.now() - started };
@@ -120,7 +120,7 @@ export class PreviewService {
     const after = await fileFingerprint(path);
     if (fingerprintKey(after) !== fingerprintKey(before)) {
       retried = true;
-      const retryKey = previewCacheKeyString(request.artifactRef, fingerprintKey(after));
+      const retryKey = previewCacheKeyString(request.artifactRef, fingerprintKey(after), request.visual);
       model = await this.render(request, format, path, retryKey, after);
     }
 
@@ -143,6 +143,9 @@ export class PreviewService {
         artifactRef: request.artifactRef,
         format,
         consistency: "optimistic",
+        // P0-7: quick previews stay light (ZIP/index); visual previews
+        // upgrade to the full engine read model.
+        profile: request.visual ? "full" : "metadata",
         priority: PRIORITY_MAP[request.priority],
         consumer: `preview:${request.requestId}`
       });
@@ -194,7 +197,8 @@ export class PreviewService {
           outline,
           cacheKey,
           fingerprintAtRender: fingerprintKey(fingerprint),
-          svgSlides: svgSlidesFromGenOffice(lease.context, 6)
+          // SVG rendering requires the full engine model (visual profile only).
+          svgSlides: request.visual ? svgSlidesFromGenOffice(lease.context, 6) : undefined
         };
         if (this.cache.admit(JSON.stringify(model).length)) {
           this.cache.set(cacheKeyString, model);
@@ -234,6 +238,6 @@ export class PreviewService {
   }
 }
 
-function previewCacheKeyString(ref: string, fpKey: string): string {
-  return `${ref}|${fpKey}`;
+function previewCacheKeyString(ref: string, fpKey: string, visual?: boolean): string {
+  return `${ref}|${fpKey}${visual ? "|v" : ""}`;
 }

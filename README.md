@@ -4,8 +4,8 @@
 > 依据 [docs/Office Plugin 设计文档.md](docs/Office%20Plugin%20设计文档.md) v3.0（Architecture Freeze Candidate）完整实现。
 
 **运行原则**：Offline First · Read Optimized · Native Editor · Agent Safe · Recoverable
-**核心实现**：GenOffice（编辑器适配边界，等待 vendor 接入）+ OfficeCLI 1.x（Agent 变更引擎，已接真实引擎）
-**运行时依赖**：零（`node:sqlite` / `node:crypto` / `node:fs` / `node:zlib`），Node ≥ 24
+**核心实现**：GenOffice（vendor @d35d770，引擎已接入）+ OfficeCLI 1.x（真实引擎）+ WPS KWPP COM（L7 认证）
+**运行时依赖**：无网络、无外部服务——全部为本地 npm 包与预编译原生库（jszip / fast-xml-parser / opentype.js / bidi-js / utif2 / sharp + 本地 `genoffice-vendor` bundle），Node ≥ 24
 
 ---
 
@@ -91,6 +91,12 @@ await plugin.acceptCandidate(session.sessionId);  // §75 原子提交 → 修�
 **INV**：01 候选隔离 · 02 单写者 · 03 fencing · 04 幂等 · 05 基线绑定 · 06 flush 屏障 · 07 handoff 屏障 · 08 验证哈希绑定 · 09 人工修订失效 · 10 源哈希校验 · 11 全量过 AtomicFileCommitter · 12 无路径泄漏 · 13 未知 OOXML 保序（diff 只分类不丢弃） · 14 文档内容=不可信数据（策略引擎） · 15 无半写提交 —— 全部有对应断言。
 
 **PERF**：01/02/03 preview/open 零写路径成本 · 04/05/06 并发去重与取消 · 07 强哈希不阻首屏 · 08/10 Actor 控制专用 + 前台优先 · 11 缓存准入+逐出 · 12 dispose 全释放 · 13 有界工作集 · 15 同文件共享上下文 —— 均有测试或基准判定。
+
+## 基准与证据的边界（如实声明）
+
+`npm run bench` 的 5 项判定是**基础设施绿灯**（内存有界、TTFP/TTE 分布、有界视口），
+阈值是 PoC 级而非 release gate：Editor 内存基线不代表最终 GenOffice 视觉编辑器的
+真实占用（canvas/GPU/字体不在 JS heap），Editor 集成后需重新校准阈值并纳入 CI。
 
 ## 引擎交互备忘（实测 officecli 1.0.148）
 

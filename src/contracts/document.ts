@@ -98,6 +98,7 @@ export type SessionErrorCode =
   | "artifact-missing"
   | "io-error"
   | "policy-denied"
+  | "idempotency-conflict"
   | "scope-violation";
 
 export class OfficeRuntimeError extends Error {

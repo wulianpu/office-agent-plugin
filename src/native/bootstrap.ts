@@ -31,7 +31,15 @@ export type RuntimeResponse =
  */
 export async function handleRuntimeRequest(
   service: OfficeRuntimeService,
-  request: RuntimeRequest
+  request: RuntimeRequest,
+  plugin?: {
+    beginAgentTask(sessionId: string, scope: { intent: string; destructiveAllowed?: boolean; allowedTargets?: string[] }): Promise<{ taskId: string; candidateId: string; baseRevisionId: string; fencingToken: bigint }>;
+    executeAgentMutation(task: unknown, command: { commandId: string; idempotencyKey: string; payload: unknown[] }): Promise<unknown>;
+    flushAgentCandidate(task: unknown): Promise<string>;
+    finalizeAgentTask(task: unknown): Promise<void>;
+    acceptCandidate(sessionId: string): Promise<{ revisionId: string; contextPromoted: boolean }>;
+    rejectCandidate(sessionId: string): Promise<void>;
+  }
 ): Promise<RuntimeResponse> {
   try {
     switch (request.kind) {
@@ -63,8 +71,50 @@ export async function handleRuntimeRequest(
       }
       case "capabilities":
         return { kind: "ok", data: new OfficeMcpTools(service).capabilities() };
+      case "agent.begin": {
+        if (!plugin) return { kind: "error", code: "unsupported", message: "agent RPC requires the plugin facade" };
+        const task = await plugin.beginAgentTask(request.sessionId, {
+          intent: request.intent ?? "rpc",
+          destructiveAllowed: request.destructiveAllowed ?? false,
+          allowedTargets: request.allowedTargets
+        });
+        return { kind: "ok", data: { taskId: task.taskId, candidateId: task.candidateId, baseRevisionId: task.baseRevisionId, fencingToken: task.fencingToken.toString() } };
+      }
+      case "agent.edit": {
+        if (!plugin) return { kind: "error", code: "unsupported", message: "agent RPC requires the plugin facade" };
+        const tasks = service.agent.activeTasks();
+        const task = tasks.find((t) => t.taskId === request.taskId);
+        if (!task) return { kind: "error", code: "not_found", message: `unknown task ${request.taskId}` };
+        const receipt = await plugin.executeAgentMutation(task, {
+          commandId: `rpc-${request.taskId}-${request.idempotencyKey}`,
+          idempotencyKey: request.idempotencyKey,
+          payload: request.items
+        });
+        return { kind: "ok", data: receipt };
+      }
+      case "agent.flush":
+      case "agent.finalize": {
+        if (!plugin) return { kind: "error", code: "unsupported", message: "agent RPC requires the plugin facade" };
+        const task = service.agent.activeTasks().find((t) => t.taskId === request.taskId);
+        if (!task) return { kind: "error", code: "not_found", message: `unknown task ${request.taskId}` };
+        if (request.kind === "agent.flush") {
+          return { kind: "ok", data: { contentHash: await plugin.flushAgentCandidate(task) } };
+        }
+        await plugin.finalizeAgentTask(task);
+        return { kind: "ok", data: { finalized: true } };
+      }
+      case "candidate.accept": {
+        if (!plugin) return { kind: "error", code: "unsupported", message: "candidate RPC requires the plugin facade" };
+        const accepted = await plugin.acceptCandidate(request.sessionId);
+        return { kind: "ok", data: accepted };
+      }
+      case "candidate.reject": {
+        if (!plugin) return { kind: "error", code: "unsupported", message: "candidate RPC requires the plugin facade" };
+        await plugin.rejectCandidate(request.sessionId);
+        return { kind: "ok", data: { rejected: true } };
+      }
       default:
-        return { kind: "error", code: "unsupported", message: `request ${request.kind} requires the high-level plugin API` };
+        return { kind: "error", code: "unsupported", message: `unsupported request ${(request as { kind: string }).kind}` };
     }
   } catch (error) {
     return {

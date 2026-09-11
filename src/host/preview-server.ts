@@ -64,13 +64,6 @@ export class PreviewHost {
     const url = new URL(req.url ?? "/", "http://localhost");
     const parts = url.pathname.split("/").filter(Boolean);
 
-    if (req.method === "POST" && url.pathname === "/api/register") {
-      const body = await readBody(req);
-      const path = String(JSON.parse(body).path ?? "");
-      const ref = await this.plugin.registerArtifact(path);
-      return json(res, 200, { artifactRef: ref, format: this.plugin.service.store.formatOf(ref) });
-    }
-
     if (url.pathname === "/" || url.pathname === "/app") {
       return html(res, galleryPage());
     }
@@ -87,7 +80,7 @@ export class PreviewHost {
       return json(res, 200, JSON.parse(JSON.stringify({ format: model.model.format, outline: model.model.outline, svgCount: model.model.svgSlides?.length ?? 0 })));
     }
     if (parts[0] === "svg" && parts[1] && parts[2]) {
-      const model = await this.plugin.preview({ artifactRef: parts[1], priority: "visible" });
+      const model = await this.plugin.preview({ artifactRef: parts[1], priority: "visible", visual: true });
       const svg = model.model.svgSlides?.[Number(parts[2])];
       if (!svg) return json(res, 404, { error: "slide svg not found" });
       res.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
@@ -95,7 +88,7 @@ export class PreviewHost {
       return;
     }
     if (parts[0] === "png" && parts[1] && parts[2]) {
-      const model = await this.plugin.preview({ artifactRef: parts[1], priority: "visible" });
+      const model = await this.plugin.preview({ artifactRef: parts[1], priority: "visible", visual: true });
       const svg = model.model.svgSlides?.[Number(parts[2])];
       if (!svg) return json(res, 404, { error: "slide svg not found" });
       const raster = await this.raster.rasterize(svg, { width: Number(url.searchParams.get("w") ?? 960) });
@@ -105,12 +98,6 @@ export class PreviewHost {
     }
     json(res, 404, { error: "not found" });
   }
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  let body = "";
-  for await (const chunk of req) body += chunk;
-  return body;
 }
 
 function json(res: ServerResponse, status: number, payload: unknown): void {

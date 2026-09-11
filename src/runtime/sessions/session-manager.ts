@@ -13,6 +13,7 @@ import type { ArtifactStore } from "../../artifact/store/artifact-store.js";
 import type { ArtifactScanner } from "../../artifact/scanner/scanner.js";
 import type { RuntimeRepositories } from "../persistence/repositories.js";
 import type { DurableEventBus } from "../sessions/event-bus.js";
+import type { CommittedRevision } from "../../contracts/revision.js";
 import type { RevisionLog } from "../revisions/revision-log.js";
 import type { CandidateManager } from "../candidates/candidate-manager.js";
 import { Scheduler } from "../scheduler/scheduler.js";
@@ -35,6 +36,8 @@ export class SessionActor {
 
 export class SessionManager {
   private readonly sessions = new Map<SessionId, { session: DocumentSession; actor: SessionActor; readiness: WriteReadinessState }>();
+  /** Background strong-identity promises per session (P0-6 §52). */
+  private readonly strongIdentity = new Map<SessionId, Promise<CommittedRevision>>();
 
   constructor(
     private readonly store: ArtifactStore,
@@ -47,8 +50,11 @@ export class SessionManager {
   ) {}
 
   /**
-   * Formal open (§12): creates a read-only DocumentSession pinned to the
-   * current committed revision. No WriterLease is acquired (PERF-03).
+   * Formal open (§12, P0-6/§六): creates a read-only DocumentSession and
+   * returns it READY immediately (optimistic fingerprint identity). The
+   * strong SHA-256 runs in the background; writer paths (edit/agent/accept)
+   * block on `ensureStrongIdentity` — interactive open is never gated by a
+   * full-file hash (PERF-03/§52).
    */
   async open(artifactRef: ArtifactRef): Promise<DocumentSession> {
     const format = this.store.formatOf(artifactRef);
@@ -66,21 +72,16 @@ export class SessionManager {
       createdAt: Date.now()
     });
 
-    // The strong scan runs on the scheduler (actor stays control-only §42).
-    const sourceHash = await this.scheduler
-      .submit({
-        label: `open-hash:${sessionId}`,
-        priority: "EDIT_PROMOTION",
-        run: () => this.scanner.hashOnly(this.store.resolvePath(artifactRef))
-      })
-      .promise;
-
-    const revision = this.revisions.commit({
+    // Optimistic placeholder — strong identity binds in the background.
+    const placeholder: CommittedRevision = {
+      revisionId: `rev_pending_${sessionId}`,
       sessionId,
+      sequence: 0,
       artifactRef,
-      contentHash: sourceHash,
-      origin: "external"
-    });
+      contentHash: "",
+      origin: "external",
+      createdAt: Date.now()
+    };
 
     const session: DocumentSession = {
       sessionId,
@@ -89,11 +90,11 @@ export class SessionManager {
       backend: "managed-file",
       lifecycle: "ready",
       sessionEpoch: 1,
-      committedRevision: revision,
+      committedRevision: placeholder,
       artifactRef,
       createdAt: Date.now()
     };
-    this.sessions.set(sessionId, { session, actor: new SessionActor(), readiness: { readiness: "cold" } });
+    this.sessions.set(sessionId, { session, actor: new SessionActor(), readiness: { readiness: "probing" } });
     this.repos.upsertSession({
       sessionId,
       documentId,
@@ -104,10 +105,39 @@ export class SessionManager {
       epoch: 1,
       createdAt: session.createdAt
     });
+
+    // Background strong hash → real committed revision (§52 Write Readiness).
+    const strong = (async () => {
+      const sourceHash = await this.scheduler
+        .submit({
+          label: `open-hash:${sessionId}`,
+          priority: "EDIT_PROMOTION",
+          run: () => this.scanner.hashOnly(this.store.resolvePath(artifactRef))
+        })
+        .promise;
+      const revision = this.revisions.commit({
+        sessionId,
+        artifactRef,
+        contentHash: sourceHash,
+        origin: "external"
+      });
+      const live = this.sessions.get(sessionId);
+      if (live && !live.session.committedRevision.contentHash) {
+        this.updateSession(sessionId, (s) => {
+          s.committedRevision = revision;
+        });
+        this.setReadiness(sessionId, { readiness: "ready", strongHash: sourceHash, probedAt: Date.now() });
+      }
+      return revision;
+    })();
+    this.strongIdentity.set(sessionId, strong);
+    // A failed background hash surfaces on the next ensureStrongIdentity call.
+    strong.catch(() => undefined);
+
     await this.events.emit(sessionId, 1, "session.opened", {
       documentId,
       artifactRef,
-      revisionId: revision.revisionId
+      revisionId: placeholder.revisionId
     });
     return session;
   }
@@ -124,6 +154,18 @@ export class SessionManager {
 
   actor(sessionId: SessionId): SessionActor {
     return this.requireEntry(sessionId).actor;
+  }
+
+  /**
+   * §52/P0-6: writer paths (edit promotion, agent task, save, accept) wait
+   * for the background strong hash here; interactive open never does.
+   */
+  async ensureStrongIdentity(sessionId: SessionId): Promise<CommittedRevision> {
+    const pending = this.strongIdentity.get(sessionId);
+    if (pending) return pending;
+    const session = this.require(sessionId);
+    if (session.committedRevision.contentHash) return session.committedRevision;
+    throw new OfficeRuntimeError("recovery-required", `session ${sessionId} has no strong identity`);
   }
 
   readiness(sessionId: SessionId): WriteReadinessState {
@@ -192,6 +234,7 @@ export class SessionManager {
         await this.events.emit(sessionId, entry.session.sessionEpoch, "session.closed", {});
       })
       .catch(() => undefined);
+    this.strongIdentity.delete(sessionId);
   }
 
   list(): DocumentSession[] {

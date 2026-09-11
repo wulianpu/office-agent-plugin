@@ -24,8 +24,9 @@ export interface CommitPathsRequest {
   candidateId: string;
   sourcePath: string;
   candidatePath: string;
-  /** ArtifactRef the committed revision records for the source. */
-  sessionArtifactRef?: string;
+  /** ArtifactRef the committed revision records for the source (required —
+   *  the revision row must never persist an empty ref). */
+  sessionArtifactRef: string;
   /** Hash the source must still have at replace time (INV-10). */
   expectedSourceHash: string;
   candidateHash: string;
@@ -134,11 +135,10 @@ export class AtomicFileCommitter {
 
     const revision = this.revisions.commit({
       sessionId: request.sessionId,
-      artifactRef: "", // service层填充 artifactRef（见 OfficeRuntimeService.acceptCandidate）
+      artifactRef: request.sessionArtifactRef,
       contentHash: replacedHash,
       origin: request.origin
     });
-    const revisionWithRef = { ...revision, artifactRef: request.sessionArtifactRef ?? revision.artifactRef };
 
     this.selfWrites.register({
       commitId,
@@ -153,7 +153,7 @@ export class AtomicFileCommitter {
       contentHash: replacedHash,
       commitId
     });
-    return { commitId, newRevision: revisionWithRef, journalOutcome: "finalized" };
+    return { commitId, newRevision: revision, journalOutcome: "finalized" };
   }
 
   private async journal(record: CommitJournalRecord, phase: CommitPhase): Promise<void> {

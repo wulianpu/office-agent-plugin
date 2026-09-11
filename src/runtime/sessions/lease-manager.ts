@@ -9,10 +9,18 @@ import type { LeaseAcquireInput, WriterLease } from "../../contracts/lease.js";
 import { FencedError } from "../../contracts/lease.js";
 import { OfficeRuntimeError } from "../../contracts/document.js";
 import { newLeaseId } from "../../support/ids.js";
+import { resolve } from "node:path";
 import type { RuntimeRepositories } from "../persistence/repositories.js";
 
 export class LeaseManager {
   private readonly active = new Map<SessionId, WriterLease>();
+  /**
+   * P0-4 §38/P11: Single Writer is per LOGICAL DOCUMENT, not per session.
+   * Keyed by canonical source path so two sessions on the same file cannot
+   * both hold writers (the freeze: "同一个 DocumentSession 最多一个 Writer"
+   * with sessions deduplicated per document at the lease level).
+   */
+  private readonly bySource = new Map<string, WriterLease>();
 
   constructor(private readonly repos: RuntimeRepositories) {}
 
@@ -27,13 +35,21 @@ export class LeaseManager {
   acquire(
     sessionId: SessionId,
     sessionEpoch: number,
-    input: LeaseAcquireInput
+    input: LeaseAcquireInput & { sourcePath: string }
   ): WriterLease {
     const existing = this.active.get(sessionId);
     if (existing) {
       throw new OfficeRuntimeError(
         "lease-held",
         `session ${sessionId} already has an active ${existing.owner} writer (lease ${existing.leaseId})`
+      );
+    }
+    const sourceKey = resolve(input.sourcePath);
+    const documentWriter = this.bySource.get(sourceKey);
+    if (documentWriter) {
+      throw new OfficeRuntimeError(
+        "lease-held",
+        `document already has an active ${documentWriter.owner} writer from session ${documentWriter.sessionId} (lease ${documentWriter.leaseId})`
       );
     }
     const fencingToken = this.repos.latestFencingToken(sessionId) + 1n;
@@ -48,6 +64,7 @@ export class LeaseManager {
       acquiredAt: Date.now()
     };
     this.active.set(sessionId, lease);
+    this.bySource.set(sourceKey, lease);
     this.repos.insertLease(lease);
     return lease;
   }
@@ -56,6 +73,7 @@ export class LeaseManager {
     for (const [sessionId, lease] of this.active) {
       if (lease.leaseId === leaseId) {
         this.active.delete(sessionId);
+        this.removeFromSourceIndex(lease);
         this.repos.releaseLease(leaseId);
         return;
       }
@@ -66,9 +84,19 @@ export class LeaseManager {
     const lease = this.active.get(sessionId);
     if (lease) {
       this.active.delete(sessionId);
+      this.removeFromSourceIndex(lease);
       this.repos.releaseLease(lease.leaseId);
     }
     return lease;
+  }
+
+  private removeFromSourceIndex(lease: WriterLease): void {
+    for (const [key, indexed] of this.bySource) {
+      if (indexed.leaseId === lease.leaseId) {
+        this.bySource.delete(key);
+        return;
+      }
+    }
   }
 
   /** Validate a writer action against the current lease (INV-03). */

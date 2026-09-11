@@ -3,7 +3,7 @@
  */
 
 import type { OfficeFormat, RevisionId, SessionId } from "./ids.js";
-import type { ArtifactContext } from "./artifact.js";
+import type { ArtifactContext, ArtifactLease } from "./artifact.js";
 import type { ViewBookmark } from "./document.js";
 
 /** §34: editor state machine, independent of session/candidate states. */
@@ -94,4 +94,6 @@ export interface EditorBinding {
   plugin: OfficeEditorPlugin;
   host: EditorHost;
   boundAt: number;
+  /** The registry lease pinning the editor's ArtifactContext; released with the editor. */
+  artifactLease?: ArtifactLease;
 }

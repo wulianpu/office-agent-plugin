@@ -90,7 +90,8 @@ describe("WriterLease & fencing (§38–§40, INV-02/03)", () => {
       sessionId: session.sessionId,
       owner: "agent",
       backend: "officecli",
-      baseRevisionId: session.committedRevision.revisionId
+      baseRevisionId: session.committedRevision.revisionId,
+      sourcePath: ws.plugin.service.store.resolvePath(session.artifactRef)
     });
     expect(newLease.fencingToken).toBeGreaterThan(task.fencingToken);
 

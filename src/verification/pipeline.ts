@@ -148,13 +148,22 @@ export class VerificationPipeline {
     }
   }
 
+  /**
+   * L3 (engine semantic issues): the engine loads the document ROOT and
+   * answers a structural query — a semantic load pass, deliberately distinct
+   * from L1's schema validation (previously both ran the same validate call).
+   */
   private async checkL3(candidatePath: string): Promise<CheckResult> {
     const started = Date.now();
     try {
-      const result = await this.deps.adapter.validate(candidatePath);
-      if (result.passed) return pass("L3-officecli-issues", started);
+      const data = (await this.deps.adapter.get(candidatePath, "/")) as
+        | { matches?: number }
+        | undefined;
+      if (data && typeof data.matches === "number") {
+        return pass("L3-officecli-issues", started);
+      }
       return fail("L3-officecli-issues", started, [
-        { severity: "error", code: "engine-issues", message: result.message }
+        { severity: "error", code: "engine-no-root", message: "engine returned no root node" }
       ]);
     } catch (error) {
       return fail("L3-officecli-issues", started, [
@@ -264,19 +273,10 @@ export class VerificationPipeline {
       }
     }
 
-    try {
-      const data = (await this.deps.adapter.get(candidatePath, "/")) as
-        | { matches?: number }
-        | undefined;
-      if (data && typeof data.matches === "number") {
-        return pass("L5-changed-scope-render", started);
-      }
-      return pass("L5-changed-scope-render", started);
-    } catch (error) {
-      return fail("L5-changed-scope-render", started, [
-        { severity: "error", code: "render-error", message: String(error) }
-      ]);
-    }
+    // Honest confidence: only PPTX has a pixel path (SVG→PNG). Other formats
+    // have no renderer here — skip instead of passing, so "visual" is never
+    // claimed without pixels (§81/§82).
+    return skipped("L5-changed-scope-render", "no pixel renderer for this format (pptx-only)");
   }
 
   /**

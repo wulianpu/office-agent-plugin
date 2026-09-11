@@ -8,7 +8,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 export class RuntimeDatabase {
   readonly db: DatabaseSync;
@@ -139,6 +139,23 @@ export class RuntimeDatabase {
           manifest TEXT NOT NULL,
           corrupt_entries TEXT NOT NULL,
           scanned_at INTEGER NOT NULL
+        );
+      `);
+    }
+    if (version === 2) {
+      // v2 (§61): idempotency moves from (session_id, key) to (candidate_id,
+      // key) with a payload digest — retries are per-task; cross-task key
+      // reuse with a different payload raises IDEMPOTENCY_CONFLICT.
+      this.db.exec(`
+        DROP TABLE IF EXISTS idempotency;
+        CREATE TABLE idempotency (
+          candidate_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          command_id TEXT NOT NULL,
+          payload_digest TEXT NOT NULL,
+          receipt TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (candidate_id, idempotency_key)
         );
       `);
     }

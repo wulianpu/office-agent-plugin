@@ -425,37 +425,53 @@ export class RuntimeRepositories
     );
   }
 
-  // ---- idempotency ----
+  // ---- idempotency (v2: candidate-scoped, §61) ----
 
-  saveIdempotentReceipt(
-    sessionId: SessionId,
-    idempotencyKey: string,
-    commandId: string,
-    receipt: MutationReceipt
-  ): void {
+  saveIdempotentReceipt(input: {
+    candidateId: string;
+    idempotencyKey: string;
+    commandId: string;
+    payloadDigest: string;
+    receipt: MutationReceipt;
+  }): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO idempotency (session_id, idempotency_key, command_id, receipt, created_at)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT OR IGNORE INTO idempotency (candidate_id, idempotency_key, command_id, payload_digest, receipt, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(sessionId, idempotencyKey, commandId, JSON.stringify(receipt), Date.now());
+      .run(
+        input.candidateId,
+        input.idempotencyKey,
+        input.commandId,
+        input.payloadDigest,
+        JSON.stringify(input.receipt),
+        Date.now()
+      );
   }
 
   getIdempotentReceipt(
-    sessionId: SessionId,
+    candidateId: string,
     idempotencyKey: string
-  ): { commandId: string; receipt: MutationReceipt } | undefined {
+  ): { commandId: string; payloadDigest: string; receipt: MutationReceipt } | undefined {
     const row = this.db
-      .prepare("SELECT command_id, receipt FROM idempotency WHERE session_id = ? AND idempotency_key = ?")
-      .get(sessionId, idempotencyKey) as { command_id: string; receipt: string } | undefined;
+      .prepare(
+        "SELECT command_id, payload_digest, receipt FROM idempotency WHERE candidate_id = ? AND idempotency_key = ?"
+      )
+      .get(candidateId, idempotencyKey) as
+      | { command_id: string; payload_digest: string; receipt: string }
+      | undefined;
     if (!row) return undefined;
-    return { commandId: row.command_id, receipt: JSON.parse(row.receipt) as MutationReceipt };
+    return {
+      commandId: row.command_id,
+      payloadDigest: row.payload_digest,
+      receipt: JSON.parse(row.receipt) as MutationReceipt
+    };
   }
 
-  countIdempotencyExecutions(sessionId: SessionId, idempotencyKey: string): number {
+  countIdempotencyExecutions(candidateId: string, idempotencyKey: string): number {
     const row = this.db
-      .prepare("SELECT COUNT(*) AS c FROM idempotency WHERE session_id = ? AND idempotency_key = ?")
-      .get(sessionId, idempotencyKey) as { c: number };
+      .prepare("SELECT COUNT(*) AS c FROM idempotency WHERE candidate_id = ? AND idempotency_key = ?")
+      .get(candidateId, idempotencyKey) as { c: number };
     return row.c;
   }
 }

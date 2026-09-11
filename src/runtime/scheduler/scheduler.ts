@@ -10,10 +10,23 @@ import {
 } from "../../contracts/scheduler.js";
 import type { AsyncWorkIdentity } from "../../contracts/document.js";
 import { isAsyncWorkStale } from "../../contracts/document.js";
+import type { ResourceGovernor } from "../resources/resource-governor.js";
 
 export interface SchedulerJob<T> {
   label: string;
   priority: SchedulerPriorityName;
+  /**
+   * P1e (§105-§106): resource classes this job consumes. When a governor is
+   * attached, the scheduler acquires/releases real leases around execution —
+   * budgets actually gate work instead of being advisory accounting.
+   */
+  resources?: {
+    cpu?: number;
+    io?: number;
+    render?: number;
+    nativeProcess?: number;
+    estimatedBytes?: number;
+  };
   /** Freshness identity checked before start and before result delivery (§43). */
   identity?: AsyncWorkIdentity;
   current?: () => { sessionEpoch?: number; fencingToken?: bigint; candidateId?: string } | undefined;
@@ -44,6 +57,8 @@ interface QueuedJob {
 export interface SchedulerOptions {
   maxConcurrent?: number;
   maxQueuePerPriority?: number;
+  /** P1e: when present, jobs carrying `resources` acquire real leases. */
+  governor?: ResourceGovernor;
 }
 
 export class Scheduler {
@@ -54,9 +69,12 @@ export class Scheduler {
   private readonly maxQueuePerPriority: number;
   readonly stats = { started: 0, completed: 0, cancelled: 0, staleDropped: 0, backpressureDrops: 0 };
 
+  private readonly governor?: ResourceGovernor;
+
   constructor(options: SchedulerOptions = {}) {
     this.maxConcurrent = options.maxConcurrent ?? 8;
     this.maxQueuePerPriority = options.maxQueuePerPriority ?? 256;
+    this.governor = options.governor;
   }
 
   submit<T>(job: SchedulerJob<T>): ScheduledHandle<T> {
@@ -151,6 +169,19 @@ export class Scheduler {
       this.pump();
       return;
     }
+    // P1e: real budget enforcement — the governor lease spans execution.
+    const lease = job.resources
+      ? await this.governor?.acquire({
+          classes: {
+            ...(job.resources.cpu ? { cpu: job.resources.cpu } : {}),
+            ...(job.resources.io ? { io: job.resources.io } : {}),
+            ...(job.resources.render ? { render: job.resources.render } : {}),
+            ...(job.resources.nativeProcess ? { "native-process": job.resources.nativeProcess } : {})
+          },
+          bytes: job.resources.estimatedBytes,
+          label: `job:${job.label}`
+        })
+      : undefined;
     try {
       const result = await job.run(queued.abort.signal);
       if (this.isStale(job)) {
@@ -163,6 +194,7 @@ export class Scheduler {
     } catch (error) {
       queued.reject(error);
     } finally {
+      lease?.release();
       this.stats.completed++;
       this.running--;
       this.pump();

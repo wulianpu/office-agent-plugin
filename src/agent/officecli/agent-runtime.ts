@@ -36,6 +36,17 @@ export interface AgentRuntimeDeps {
   policy?: OperationPolicyEngine;
 }
 
+/** Stable payload digest for idempotency conflict detection (§61). */
+function digestPayload(items: unknown): string {
+  const json = JSON.stringify(items);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < json.length; i++) {
+    hash ^= json.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${json.length}:${(hash >>> 0).toString(36)}`;
+}
+
 export class AgentRuntime {
   readonly policy: OperationPolicyEngine;
   private readonly tasks = new Map<string, { context: OfficeTaskContext; lease: WriterLease; mode: "standalone" | "resident"; residentOpened: boolean }>();
@@ -44,14 +55,20 @@ export class AgentRuntime {
     this.policy = deps.policy ?? new OperationPolicyEngine();
   }
 
-  /** Acquire the agent writer lease and clone the committed revision (§158). */
+  /**
+   * Acquire the agent writer lease and clone the committed revision (§158).
+   * P0-6 three-phase: the mailbox is held only for control; the file clone
+   * runs on the scheduler and the candidate registers back inside the actor
+   * only if the revision is still fresh.
+   */
   async beginAgentTask(sessionId: SessionId, scope: MutationScope): Promise<OfficeTaskContext> {
     const session = this.deps.sessions.require(sessionId);
     if (session.lifecycle !== "ready") {
       throw new OfficeRuntimeError("recovery-required", `session lifecycle is ${session.lifecycle}`);
     }
-    const epoch = session.sessionEpoch;
-    return this.deps.sessions.actor(sessionId).enqueue(async () => {
+    // §52: the agent writer path requires strong identity (open stays light).
+    const baseRevision = await this.deps.sessions.ensureStrongIdentity(sessionId);
+    const captured = await this.deps.sessions.actor(sessionId).enqueue(async () => {
       const live = this.deps.sessions.require(sessionId);
       if (live.candidate && live.candidate.state !== "failed" && live.candidate.state !== "committing") {
         throw new OfficeRuntimeError(
@@ -59,21 +76,72 @@ export class AgentRuntime {
           `session already has an active candidate ${live.candidate.candidateId} in state ${live.candidate.state}`
         );
       }
-      const lease = this.deps.leases.acquire(sessionId, epoch, {
+      return {
+        epoch: live.sessionEpoch,
+        revisionId: live.committedRevision.revisionId,
+        artifactRef: live.artifactRef,
+        documentId: live.documentId
+      };
+    });
+
+    const lease = await this.deps.sessions.actor(sessionId).enqueue(async () => {
+      const live = this.deps.sessions.require(sessionId);
+      if (live.committedRevision.revisionId !== captured.revisionId || live.sessionEpoch !== captured.epoch) {
+        throw new OfficeRuntimeError("recovery-required", "session revision moved; retry the task");
+      }
+      const acquired = this.deps.leases.acquire(sessionId, live.sessionEpoch, {
         sessionId,
         owner: "agent",
         backend: "officecli",
-        baseRevisionId: live.committedRevision.revisionId
+        baseRevisionId: live.committedRevision.revisionId,
+        sourcePath: this.deps.store.resolvePath(live.artifactRef)
       });
-      await this.deps.events.emit(sessionId, epoch, "lease.acquired", {
-        leaseId: lease.leaseId,
-        owner: lease.owner,
-        fencingToken: lease.fencingToken.toString()
+      await this.deps.events.emit(sessionId, live.sessionEpoch, "lease.acquired", {
+        leaseId: acquired.leaseId,
+        owner: acquired.owner,
+        fencingToken: acquired.fencingToken.toString()
       });
-      const candidate = await this.deps.candidates.create(sessionId, epoch, live.committedRevision, "agent");
-      await this.deps.candidates.transition(candidate.candidateId, epoch, "mutating");
       this.deps.sessions.updateSession(sessionId, (s) => {
-        s.writerLease = lease;
+        s.writerLease = acquired;
+      });
+      return acquired;
+    });
+
+    // Clone dispatched OFF the actor mailbox (heavy I/O, §42).
+    let stagingRef: string;
+    try {
+      stagingRef = await this.deps.scheduler
+        .submit({
+          label: `candidate-clone:${sessionId}`,
+          priority: "AGENT_FOREGROUND",
+          resources: { io: 1 },
+          run: () => this.deps.store.createStagingCopy(captured.artifactRef)
+        })
+        .promise;
+    } catch (error) {
+      // Roll the lease back; the mailbox was free during the clone.
+      this.deps.leases.release(lease.leaseId);
+      throw error;
+    }
+
+    return this.deps.sessions.actor(sessionId).enqueue(async () => {
+      const live = this.deps.sessions.require(sessionId);
+      if (live.committedRevision.revisionId !== captured.revisionId || live.sessionEpoch !== captured.epoch) {
+        this.deps.leases.release(lease.leaseId);
+        this.deps.sessions.updateSession(sessionId, (s) => {
+          s.writerLease = undefined;
+        });
+        throw new OfficeRuntimeError("recovery-required", "session revision moved during clone; retry the task");
+      }
+      const candidate = await this.deps.candidates.register(
+        sessionId,
+        live.sessionEpoch,
+        { ...baseRevision, artifactRef: captured.artifactRef },
+        stagingRef,
+        "agent"
+      );
+      await this.deps.candidates.transition(candidate.candidateId, live.sessionEpoch, "mutating");
+      this.deps.sessions.updateSession(sessionId, (s) => {
         s.candidate = candidate;
       });
       const context: OfficeTaskContext = {
@@ -107,11 +175,17 @@ export class AgentRuntime {
     if (!tracked) {
       throw new OfficeRuntimeError("recovery-required", `unknown or finalized task ${task.taskId}`);
     }
-    // Idempotent replay (INV-04).
-    const stored = this.deps.repos.getIdempotentReceipt(task.sessionId, command.idempotencyKey);
+    // Idempotent replay (INV-04) — CANDIDATE-scoped (§61): retries bind to
+    // the task's candidate, never to the session lifetime. Same key with a
+    // different payload digest is a conflict, not a silent replay.
+    const payloadDigest = digestPayload(command.payload);
+    const stored = this.deps.repos.getIdempotentReceipt(task.candidateId, command.idempotencyKey);
     if (stored) {
-      if (stored.commandId !== command.commandId) {
-        return stored.receipt;
+      if (stored.payloadDigest !== payloadDigest) {
+        throw new OfficeRuntimeError(
+          "idempotency-conflict",
+          `idempotencyKey '${command.idempotencyKey}' was already used with a different payload on candidate ${task.candidateId}`
+        );
       }
       return stored.receipt;
     }
@@ -171,7 +245,14 @@ export class AgentRuntime {
               await this.deps.pool.acquire(candidatePath);
               tracked.residentOpened = true;
             }
-            return this.deps.adapter.runBatchStandalone(candidatePath, command.payload);
+            // Explicit resident semantics (§64): in-memory apply through the
+            // live resident; flush deferred to save/close.
+            return this.deps.adapter.runBatchResident(candidatePath, command.payload);
+          }
+          // Standalone policy (§63): one-shot open/execute/save cycle.
+          if (tracked.residentOpened) {
+            await this.deps.pool.evict(candidatePath);
+            tracked.residentOpened = false;
           }
           return this.deps.adapter.runBatchStandalone(candidatePath, command.payload);
         }
@@ -189,12 +270,13 @@ export class AgentRuntime {
       affectedTargets: affected,
       completedAt: Date.now()
     };
-    this.deps.repos.saveIdempotentReceipt(
-      task.sessionId,
-      command.idempotencyKey,
-      command.commandId,
+    this.deps.repos.saveIdempotentReceipt({
+      candidateId: task.candidateId,
+      idempotencyKey: command.idempotencyKey,
+      commandId: command.commandId,
+      payloadDigest,
       receipt
-    );
+    });
     void lease;
     return receipt;
   }
@@ -283,6 +365,11 @@ export class AgentRuntime {
 
   activeTaskCount(): number {
     return this.tasks.size;
+  }
+
+  /** Live task contexts (RPC dispatch + host introspection). */
+  activeTasks(): OfficeTaskContext[] {
+    return [...this.tasks.values()].map((tracked) => tracked.context);
   }
 
   async dispose(): Promise<void> {

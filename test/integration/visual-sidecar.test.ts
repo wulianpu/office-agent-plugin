@@ -37,7 +37,7 @@ describe("pptx headless visual rendering (§P7)", () => {
   it("previews embed standalone SVG slides containing laid-out text", async () => {
     const pptx = await fixture.pptx(ws.root, "visual.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);
-    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible" });
+    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible", visual: true });
 
     expect(result.model.svgSlides).toBeDefined();
     const svgs = result.model.svgSlides!;
@@ -52,7 +52,7 @@ describe("pptx headless visual rendering (§P7)", () => {
   it("SVG geometry carries resolved pixel boxes, not raw OOXML", async () => {
     const pptx = await fixture.pptx(ws.root, "visual2.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);
-    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible" });
+    const result = await ws.plugin.preview({ artifactRef: ref, priority: "visible", visual: true });
     const first = result.model.svgSlides?.[0]!;
     expect(first).toMatch(/width="\d+"/);
     expect(first).toMatch(/height="\d+"/);

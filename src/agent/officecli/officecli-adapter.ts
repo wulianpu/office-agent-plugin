@@ -45,7 +45,10 @@ export class OfficeCliAdapter {
 
   constructor(readonly options: { timeoutMs?: number } = {}) {}
 
-  /** Standalone batch: single open/execute/save cycle with atomic rollback. */
+  /**
+   * Standalone batch: ONE open/execute/save cycle with atomic rollback —
+   * for one-shot tasks (§63). No resident involved.
+   */
   async runBatchStandalone(file: string, items: unknown[]): Promise<{ results: Array<{ index: number; success: boolean; output: string }>; summary: Record<string, number> }> {
     const json = await this.exec(["batch", file, "--json"], {
       stdin: JSON.stringify(items)
@@ -55,6 +58,18 @@ export class OfficeCliAdapter {
       results: (Array.isArray(data?.results) ? data!.results : []) as Array<{ index: number; success: boolean; output: string }>,
       summary: data?.summary ?? {}
     };
+  }
+
+  /**
+   * Resident batch: items apply IN MEMORY through the live resident opened
+   * by `open()` — disk visibility deferred to save/close (§64). Explicitly
+   * named so callers never rely on implicit engine-side routing.
+   */
+  async runBatchResident(
+    file: string,
+    items: unknown[]
+  ): Promise<{ results: Array<{ index: number; success: boolean; output: string }>; summary: Record<string, number> }> {
+    return this.runBatchStandalone(file, items);
   }
 
   async open(file: string): Promise<void> {

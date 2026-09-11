@@ -29,6 +29,13 @@ export type ReadConsistency = "optimistic" | "stable";
 export type OpenIntent = "preview" | "open" | "edit";
 
 /**
+ * Build depth for an ArtifactContext (P0-7): "metadata" is the ZIP/index
+ * level (quick preview, §28-30 first useful content); "full" attaches the
+ * engine read model (GenOffice deck/blocks — open/edit/visual paths).
+ */
+export type ArtifactContextProfile = "metadata" | "full";
+
+/**
  * Core read-side identity (§19). Immutable in content, shareable,
  * reference counted via ArtifactLease, evictable, progressively enrichable (§25).
  */
@@ -37,8 +44,11 @@ export interface ArtifactContext {
   readonly version: ArtifactVersionKey;
   readonly format: OfficeFormat;
   readonly consistency: ReadConsistency;
+  readonly profile?: ArtifactContextProfile;
   readonly rendererVersion: string;
   readonly lastAccessAt: number;
+  /** Honest resident-memory estimate for registry accounting (§101). */
+  readonly estimatedResidentBytes?: number;
 
   /** Lazy enrichment payload owned by the FormatRuntime (§25). Content identity never mutates. */
   readonly enrichment: Map<string, unknown>;
@@ -56,6 +66,8 @@ export interface ArtifactBuildInput {
   artifactRef: ArtifactRef;
   format: OfficeFormat;
   consistency: ReadConsistency;
+  /** Context build depth; defaults to "metadata" (§28–§30 progressive reads). */
+  profile?: ArtifactContextProfile;
   priority: SchedulerPriorityName;
   consumer: string;
   signal?: AbortSignal;

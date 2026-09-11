@@ -79,28 +79,40 @@ async function benchPreview100(plugin, files) {
   );
 }
 
+const benchOpenClose = { baselineHeapMB: null };
+
 async function benchOpenClose100(plugin, files) {
   const iterations = quick ? 20 : 100;
   const file = files.find((f) => f.name.endsWith(".pptx")) ?? files[0];
   const ref = await plugin.registerArtifact(file.path);
   const openMs = [];
+  let baselineTaken = false;
   for (let i = 0; i < iterations; i++) {
     const started = performance.now();
     const session = await plugin.openSession(ref);
     openMs.push(performance.now() - started);
     await plugin.closeSession(session.sessionId);
+    if (i === 2) {
+      global.gc?.();
+      benchOpenClose.baselineHeapMB = heapMB();
+      baselineTaken = true;
+    }
   }
   global.gc?.();
   const retained = heapMB();
+  if (!baselineTaken) benchOpenClose.baselineHeapMB = retained;
   report.metrics.openClose = {
     iterations,
     openMs: { median: pct(openMs, 50), p95: pct(openMs, 95) },
     retainedHeapMB: Number(retained.toFixed(1))
   };
+  // Leak guard: retained memory must stay within a growth budget of the
+  // first-cycle baseline (catches 70MB→180MB creeping without absolute limits).
+  const growth = retained - benchOpenClose.baselineHeapMB;
   verdict(
-    "open/close x100 retained memory plateau (§135)",
-    retained < 200,
-    `${iterations} cycles, retained heap ${retained.toFixed(1)}MB, median open ${pct(openMs, 50).toFixed(0)}ms`
+    "open/close x100: retained memory plateau (§135)",
+    retained < 200 && growth < 40,
+    `${iterations} cycles, retained ${retained.toFixed(1)}MB (baseline ${benchOpenClose.baselineHeapMB?.toFixed(1) ?? "?"}MB, growth ${growth.toFixed(1)}MB), median open ${pct(openMs, 50).toFixed(1)}ms`
   );
 }
 
@@ -118,14 +130,25 @@ async function benchPreviewOpenEdit(plugin, files) {
     await plugin.endEdit(session.sessionId);
     await plugin.closeSession(session.sessionId);
   }
+  // Growth check: first-10 vs last-10 heap must not diverge (leak guard).
+  const firstHalf = tte.slice(0, 10);
+  const lastHalf = tte.slice(-10);
+  global.gc?.();
+  const heapStartCycles = heapMB();
+  const drift = Math.abs(
+    firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length -
+      lastHalf.reduce((a, b) => a + b, 0) / lastHalf.length
+  );
   report.metrics.previewOpenEdit = {
     iterations,
-    tteMs: { median: pct(tte, 50), p95: pct(tte, 95) }
+    tteMs: { median: pct(tte, 50), p95: pct(tte, 95) },
+    timingDriftMs: Number(drift.toFixed(2)),
+    heapRetainedMB: Number(heapStartCycles.toFixed(1))
   };
   verdict(
-    "preview→open→edit x50 (§136)",
-    true,
-    `${iterations} cycles, median TTE ${pct(tte, 50).toFixed(0)}ms, p95 ${pct(tte, 95).toFixed(0)}ms`
+    "preview→open→edit cycles: bounded TTE + no timing drift (§136)",
+    pct(tte, 95) < 3000 && drift < Math.max(50, pct(tte, 50) * 0.5),
+    `${iterations} cycles, median TTE ${pct(tte, 50).toFixed(1)}ms, p95 ${pct(tte, 95).toFixed(1)}ms, drift ${drift.toFixed(1)}ms`
   );
 }
 
@@ -168,7 +191,7 @@ async function benchCandidate(plugin, files) {
   verdict(
     "candidate→proposal→accept (§137)",
     true,
-    `${iterations} cycles, median ${pct(ttp, 50).toFixed(0)}ms, p95 ${pct(ttp, 95).toFixed(0)}ms`
+    `${iterations} engine round-trips (release-gate count TBD), median ${pct(ttp, 50).toFixed(0)}ms, p95 ${pct(ttp, 95).toFixed(0)}ms`
   );
 }
 

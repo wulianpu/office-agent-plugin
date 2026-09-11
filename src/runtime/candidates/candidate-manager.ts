@@ -32,6 +32,38 @@ export class CandidateManager {
     return persisted;
   }
 
+  /**
+   * Register a candidate over an ALREADY-CLONED staging artifact (P0-6: the
+   * file clone is dispatched by the caller onto the scheduler; this method
+   * is control-only and actor-safe).
+   */
+  async register(
+    sessionId: SessionId,
+    sessionEpoch: number,
+    base: CommittedRevision,
+    stagingRef: string,
+    createdBy: "agent" | "human"
+  ): Promise<CandidateRevision> {
+    const candidate: CandidateRevision = {
+      candidateId: newCandidateId(),
+      sessionId,
+      baseRevisionId: base.revisionId,
+      baseHash: base.contentHash,
+      artifactRef: stagingRef,
+      state: "preparing",
+      createdBy,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    this.candidates.set(candidate.candidateId, candidate);
+    this.repos.upsertCandidate(candidate);
+    await this.events.emit(sessionId, sessionEpoch, "candidate.created", {
+      candidateId: candidate.candidateId,
+      baseRevisionId: base.revisionId
+    });
+    return candidate;
+  }
+
   async create(
     sessionId: SessionId,
     sessionEpoch: number,

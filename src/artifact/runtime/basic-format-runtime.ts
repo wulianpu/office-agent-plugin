@@ -55,8 +55,11 @@ export class BasicFormatRuntime implements FormatRuntime {
       version: { artifactRef: input.artifactRef, fingerprint },
       format: this.format,
       consistency: input.consistency,
+      profile: "metadata",
       rendererVersion: BASIC_RENDERER_VERSION,
       lastAccessAt: Date.now(),
+      // Honest estimate: central-directory records + name strings retained.
+      estimatedResidentBytes: 4_096 + zipIndex.entries.length * 160,
       enrichment: new Map<string, unknown>([
         ["entryCount", zipIndex.entries.length],
         ["contentTypesPresent", state.contentTypesPresent]

@@ -75,8 +75,8 @@ export class OfficeRuntimeService {
   readonly store: ArtifactStore;
   readonly scanner: ArtifactScanner;
   readonly registry: ArtifactRegistry;
-  readonly scheduler = new Scheduler();
   readonly governor: ResourceGovernor;
+  readonly scheduler: Scheduler;
   readonly events: DurableEventBus;
   readonly editorSignals = new EditorSignalBusImpl();
 
@@ -118,6 +118,8 @@ export class OfficeRuntimeService {
   wpsProbePromise?: Promise<boolean>;
   private disposed = false;
   private readonly editorInstances = new Map<string, EditorInstance>();
+  /** ArtifactLeases pinned by live editors — released in endEdit/dispose (P0-2). */
+  private readonly editorArtifactLeases = new Map<string, ArtifactLease>();
   /** §11/P11 global: source replacements serialize per physical path, even across sessions. */
   private readonly commitChains = new Map<string, Promise<unknown>>();
 
@@ -137,6 +139,7 @@ export class OfficeRuntimeService {
   private constructor(readonly options: OfficeRuntimeServiceOptions) {
     const budgets: ResourceBudgets = { ...DEFAULT_BUDGETS, ...(options.budgets ?? {}) };
     this.governor = new ResourceGovernor(budgets);
+    this.scheduler = new Scheduler({ governor: this.governor });
     this.db = new RuntimeDatabase(options.dbPath ?? join(options.workspaceRoot, "office-runtime.db"));
     this.repos = new RuntimeRepositories(this.db);
     this.events = new DurableEventBus(this.repos);
@@ -147,7 +150,7 @@ export class OfficeRuntimeService {
     for (const format of ["docx", "xlsx", "pptx"] as const) {
       const runtime = new BasicFormatRuntime(format);
       runtime.setPathResolver(resolveByRef);
-      this.registry.registerRuntime(runtime);
+      this.registry.registerRuntime(runtime, "metadata");
     }
     this.registry.setPathResolver(resolveByRef);
 
@@ -226,8 +229,8 @@ export class OfficeRuntimeService {
     // §146: register GenOffice runtimes when the vendor bundles load.
     const vendors = await probeVendorEngines();
     this.genoffice = vendors;
-    if (vendors.pptx) this.registry.registerRuntime(this.genofficePptxRuntime);
-    if (vendors.docx) this.registry.registerRuntime(this.genofficeDocxRuntime);
+    if (vendors.pptx) this.registry.registerRuntime(this.genofficePptxRuntime, "full");
+    if (vendors.docx) this.registry.registerRuntime(this.genofficeDocxRuntime, "full");
 
     // §86: probe the optional WPS host in the BACKGROUND — §86 is optional and
     // a COM probe (seconds, retryable under contention) must never gate
@@ -270,15 +273,21 @@ export class OfficeRuntimeService {
       requestId: request.requestId ?? newRequestId(),
       artifactRef: request.artifactRef,
       priority: request.priority,
-      scope: request.scope
+      scope: request.scope,
+      visual: request.visual
     });
   }
 
-  async acquireArtifactLease(artifactRef: ArtifactRef, consumer: string): Promise<ArtifactLease> {
+  async acquireArtifactLease(
+    artifactRef: ArtifactRef,
+    consumer: string,
+    profile: "metadata" | "full" = "metadata"
+  ): Promise<ArtifactLease> {
     return this.registry.acquire({
       artifactRef,
       format: this.store.formatOf(artifactRef),
       consistency: "optimistic",
+      profile,
       priority: "VISIBLE_PREVIEW",
       consumer
     });
@@ -307,12 +316,20 @@ export class OfficeRuntimeService {
     if (session.lifecycle !== "recovery-required") {
       throw new OfficeRuntimeError("recovery-required", `session is ${session.lifecycle}, not recovery-required`);
     }
+    // P0-6 three-phase: capture → hash outside the actor → apply if fresh.
+    const captured = await this.sessions.actor(sessionId).enqueue(async () => {
+      const live = this.sessions.require(sessionId);
+      return { epoch: live.sessionEpoch, revisionId: live.committedRevision.revisionId, artifactRef: live.artifactRef };
+    });
+    const sourcePath = this.store.resolvePath(captured.artifactRef);
+    const currentHash = await this.scheduler
+      .submit({ label: `recovery-hash:${sessionId}`, priority: "EDIT_PROMOTION", run: () => sha256File(sourcePath) })
+      .promise;
     return this.sessions.actor(sessionId).enqueue(async () => {
       const live = this.sessions.require(sessionId);
-      const sourcePath = this.store.resolvePath(live.artifactRef);
-      const currentHash = await this.scheduler
-        .submit({ label: `recovery-hash:${sessionId}`, priority: "EDIT_PROMOTION", run: () => sha256File(sourcePath) })
-        .promise;
+      if (live.sessionEpoch !== captured.epoch || live.committedRevision.revisionId !== captured.revisionId) {
+        throw new OfficeRuntimeError("recovery-required", "session state changed during recovery resolution; retry");
+      }
       if (currentHash === live.committedRevision.contentHash) {
         this.sessions.updateSession(sessionId, (s) => {
           s.lifecycle = "ready";
@@ -352,10 +369,10 @@ export class OfficeRuntimeService {
     if (!plugin) {
       throw new OfficeRuntimeError("unsupported-format", `no editor plugin for ${session.format}`);
     }
-    const lease = await this.acquireArtifactLease(session.artifactRef, `editor:${sessionId}`);
+    const artifactLease = await this.acquireArtifactLease(session.artifactRef, `editor:${sessionId}`, "full");
     const editor = await this.editorHost.mount(plugin, {
       sessionId,
-      artifactContext: lease.context,
+      artifactContext: artifactLease.context,
       bookmark,
       readOnly: false
     });
@@ -365,10 +382,12 @@ export class OfficeRuntimeService {
         instanceId: editor.instanceId,
         plugin,
         host: this.editorHost,
-        boundAt: Date.now()
+        boundAt: Date.now(),
+        artifactLease
       };
     });
     this.editorInstances.set(sessionId, editor);
+    this.editorArtifactLeases.set(sessionId, artifactLease);
     return { lease: result.lease, editor };
   }
 
@@ -378,6 +397,7 @@ export class OfficeRuntimeService {
    * source changed directly.
    */
   async humanSave(sessionId: string, newContentArtifactRef?: ArtifactRef): Promise<{ revisionId: string; unchanged: boolean }> {
+    await this.sessions.ensureStrongIdentity(sessionId);
     const session = this.sessions.require(sessionId);
     if (!this.leases.activeLease(sessionId) || this.leases.activeLease(sessionId)!.owner !== "human") {
       throw new OfficeRuntimeError("lease-held", "human save requires the human writer lease");
@@ -385,40 +405,49 @@ export class OfficeRuntimeService {
     const sourcePath = this.store.resolvePath(session.artifactRef);
     const currentHash = await this.scanner.hashOnly(sourcePath);
 
-    if (newContentArtifactRef) {
-      const candidatePath = this.store.resolvePath(newContentArtifactRef);
-      const candidateHash = await this.scanner.hashOnly(candidatePath);
-      if (candidateHash === currentHash) {
-        return { revisionId: session.committedRevision.revisionId, unchanged: true };
+    if (!newContentArtifactRef) {
+      // P0-5: a bare save validates the source is still at the committed
+      // revision. Editors NEVER write the source in place — content goes to a
+      // staging artifact and through the atomic committer (same crash
+      // semantics as agents). A mutated source here is a conflict, not a
+      // revision (§74: all source replacement flows through the committer).
+      if (currentHash !== session.committedRevision.contentHash) {
+        this.sessions.updateSession(sessionId, (s) => {
+          s.lifecycle = s.lifecycle === "ready" ? "conflict" : s.lifecycle;
+        });
+        await this.events.emit(sessionId, session.sessionEpoch, "session.conflict", {
+          reason: "source-mutated-on-save",
+          expected: session.committedRevision.contentHash,
+          found: currentHash
+        });
+        throw new OfficeRuntimeError(
+          "source-mutated",
+          "source changed outside the editor; save requires a staging artifact or a reopen"
+        );
       }
-      const result = await this.serializeCommit(sourcePath, () =>
-        this.committer.commit({
-          sessionId,
-          sessionEpoch: session.sessionEpoch,
-          candidateId: `human-${sessionId}`,
-          sourcePath,
-          candidatePath,
-          sessionArtifactRef: session.artifactRef,
-          expectedSourceHash: session.committedRevision.contentHash,
-          candidateHash,
-          origin: "human"
-        })
-      );
-      this.bindCommittedRevision(sessionId, result.newRevision);
-      return { revisionId: result.newRevision.revisionId, unchanged: false };
+      return { revisionId: session.committedRevision.revisionId, unchanged: true };
     }
 
-    if (currentHash !== session.committedRevision.contentHash) {
-      const revision = this.revisions.commit({
-        sessionId,
-        artifactRef: session.artifactRef,
-        contentHash: currentHash,
-        origin: "human"
-      });
-      this.bindCommittedRevision(sessionId, revision);
-      return { revisionId: revision.revisionId, unchanged: false };
+    const candidatePath = this.store.resolvePath(newContentArtifactRef);
+    const candidateHash = await this.scanner.hashOnly(candidatePath);
+    if (candidateHash === currentHash) {
+      return { revisionId: session.committedRevision.revisionId, unchanged: true };
     }
-    return { revisionId: session.committedRevision.revisionId, unchanged: true };
+    const result = await this.serializeCommit(sourcePath, () =>
+      this.committer.commit({
+        sessionId,
+        sessionEpoch: session.sessionEpoch,
+        candidateId: `human-${sessionId}`,
+        sourcePath,
+        candidatePath,
+        sessionArtifactRef: session.artifactRef,
+        expectedSourceHash: session.committedRevision.contentHash,
+        candidateHash,
+        origin: "human"
+      })
+    );
+    this.bindCommittedRevision(sessionId, result.newRevision);
+    return { revisionId: result.newRevision.revisionId, unchanged: false };
   }
 
   /** Release the human lease (editor closed without saving / after save). */
@@ -428,6 +457,8 @@ export class OfficeRuntimeService {
       await editor.dispose().catch(() => undefined);
       this.editorInstances.delete(sessionId);
     }
+    this.editorArtifactLeases.get(sessionId)?.release();
+    this.editorArtifactLeases.delete(sessionId);
     const lease = this.leases.releaseForSession(sessionId);
     if (lease) {
       await this.events.emit(sessionId, this.sessions.require(sessionId).sessionEpoch, "lease.released", {
@@ -553,6 +584,19 @@ export class OfficeRuntimeService {
       );
 
       // Context promotion (§71–§72): same bytes → same parse; only bindings move.
+      // The candidate's FULL context (engine model) re-registers under the
+      // source's new version key — the next editor acquire hits the cache.
+      const stagingPath = this.store.resolvePath(candidate.artifactRef);
+      const { fileFingerprint, fingerprintKey } = await import("../../support/fsx.js");
+      try {
+        const stagingFp = await fileFingerprint(stagingPath);
+        this.registry.promote(
+          { artifactRef: candidate.artifactRef, fingerprintKey: fingerprintKey(stagingFp), profile: "full" },
+          { artifactRef: live.artifactRef, fingerprintKey: fingerprintKey(stagingFp), profile: "full" }
+        );
+      } catch {
+        // Staging file may already be released; promotion is best-effort.
+      }
       this.bindCommittedRevision(sessionId, result.newRevision);
       this.candidates.forget(candidateId);
       this.repos.deleteCandidate(candidateId);
@@ -577,6 +621,10 @@ export class OfficeRuntimeService {
 
   async closeSession(sessionId: string): Promise<void> {
     await this.endEdit(sessionId).catch(() => undefined);
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      this.watcher.unwatchFile(this.store.resolvePath(session.artifactRef));
+    }
     await this.sessions.close(sessionId);
   }
 
@@ -671,6 +719,8 @@ export class OfficeRuntimeService {
       await editor.dispose().catch(() => undefined);
     }
     this.editorInstances.clear();
+    for (const lease of this.editorArtifactLeases.values()) lease.release();
+    this.editorArtifactLeases.clear();
     this.watcher.dispose();
     await this.xlsxSidecar.dispose().catch(() => undefined);
     await this.registry.dispose().catch(() => undefined);

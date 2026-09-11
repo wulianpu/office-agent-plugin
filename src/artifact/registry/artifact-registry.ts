@@ -10,6 +10,7 @@
 import type {
   ArtifactBuildInput,
   ArtifactContext,
+  ArtifactContextProfile,
   ArtifactLease,
   ArtifactRegistry as IArtifactRegistry,
   ArtifactVersionKey,
@@ -32,35 +33,45 @@ interface BuildJob {
 }
 
 export class ArtifactRegistry implements IArtifactRegistry {
-  private readonly runtimes = new Map<OfficeFormat, FormatRuntime>();
+  /** format → profile → runtime (P0-7: metadata/full build depths). */
+  private readonly runtimes = new Map<OfficeFormat, Partial<Record<ArtifactContextProfile, FormatRuntime>>>();
   private readonly completed = new ByteBudgetCache<ArtifactContext>(
     "ArtifactCache",
     256 * 1024 * 1024,
-    () => CONTEXT_BYTES_ESTIMATE
+    (context) => context.estimatedResidentBytes ?? CONTEXT_BYTES_ESTIMATE
   );
   private readonly inFlight = new Map<string, BuildJob>();
   private readonly leaseConsumers = new Map<string, string>();
+  /** leaseId → { artifactRef, contextKey } for honest holders() introspection. */
+  private readonly leaseIndex = new Map<string, { artifactRef: ArtifactRef; contextKey: string }>();
   private readonly inflightConsumersByLease = new Map<string, { key: string; consumer: string }>();
 
-  registerRuntime(runtime: FormatRuntime): void {
-    this.runtimes.set(runtime.format, runtime);
+  registerRuntime(runtime: FormatRuntime, profile: ArtifactContextProfile = "metadata"): void {
+    const byProfile = this.runtimes.get(runtime.format) ?? {};
+    byProfile[profile] = runtime;
+    this.runtimes.set(runtime.format, byProfile);
   }
 
   runtimesSnapshot(): OfficeFormat[] {
     return [...this.runtimes.keys()];
   }
 
+  hasRuntime(format: OfficeFormat, profile: ArtifactContextProfile): boolean {
+    return this.runtimes.get(format)?.[profile] !== undefined;
+  }
+
   async acquire(input: ArtifactBuildInput): Promise<ArtifactLease> {
-    const runtime = this.runtimes.get(input.format);
+    const profile = input.profile ?? "metadata";
+    const runtime = this.runtimes.get(input.format)?.[profile];
     if (!runtime) {
-      throw new Error(`no FormatRuntime registered for ${input.format}`);
+      throw new Error(`no ${profile} FormatRuntime registered for ${input.format}`);
     }
     const fingerprint = await this.fingerprintFor(input.artifactRef);
-    const key = contextKey(input.artifactRef, fingerprint, input.consistency);
+    const key = contextKey(input.artifactRef, fingerprint, profile);
 
     const cached = this.completed.get(key);
     if (cached) {
-      return this.leaseFor(cached, input.consumer);
+      return this.leaseFor(cached, input.consumer, undefined, key);
     }
 
     let job = this.inFlight.get(key);
@@ -69,6 +80,7 @@ export class ArtifactRegistry implements IArtifactRegistry {
       const built: Promise<ArtifactContext> = runtime
         .createArtifactContext({
           ...input,
+          profile,
           signal: abort.signal
         })
         .then((context) => {
@@ -111,7 +123,7 @@ export class ArtifactRegistry implements IArtifactRegistry {
       });
       this.cleanupConsumerSignal(input.signal, onConsumerAbort);
       this.inflightConsumersByLease.delete(leaseId);
-      return this.leaseFor(context, input.consumer, leaseId);
+      return this.leaseFor(context, input.consumer, leaseId, key);
     } catch (error) {
       this.cleanupConsumerSignal(input.signal, onConsumerAbort);
       if (!this.inflightConsumersByLease.has(leaseId)) {
@@ -127,21 +139,41 @@ export class ArtifactRegistry implements IArtifactRegistry {
     if (signal && handler) signal.removeEventListener("abort", handler);
   }
 
-  peek(key: ArtifactVersionKey): ArtifactContext | undefined {
-    return this.completed.get(contextKey(key.artifactRef, fingerprintKey(key.fingerprint), "optimistic"));
+  peek(key: ArtifactVersionKey, profile: ArtifactContextProfile = "metadata"): ArtifactContext | undefined {
+    return this.completed.get(contextKey(key.artifactRef, fingerprintKey(key.fingerprint), profile));
   }
 
   holders(artifactRef: ArtifactRef): ReadonlyArray<{ leaseId: string; consumer: string }> {
     const out: Array<{ leaseId: string; consumer: string }> = [];
     for (const [leaseId, consumer] of this.leaseConsumers) {
-      out.push({ leaseId, consumer });
+      if (this.leaseIndex.get(leaseId)?.artifactRef === artifactRef) {
+        out.push({ leaseId, consumer });
+      }
     }
-    return out.filter(() => true).map((h) => h); // stable snapshot; contexts carry ref in debug
+    return out;
   }
 
   /** Count live leases (debug/introspection for §22 diagrams). */
   leaseCount(): number {
     return this.leaseConsumers.size;
+  }
+
+  /**
+   * §71–§72 Context Promotion: when a candidate's bytes become the committed
+   * source (same content, new logical role), the already-parsed context is
+   * re-registered under the source's version key — Accept costs zero reparse.
+   * The stored context keeps its parsed engine model (WeakMap identity) even
+   * though its artifactRef field still names the staging origin.
+   */
+  promote(from: { artifactRef: ArtifactRef; fingerprintKey: string; profile: ArtifactContextProfile }, to: { artifactRef: ArtifactRef; fingerprintKey: string; profile?: ArtifactContextProfile }): boolean {
+    const fromKey = contextKey(from.artifactRef, from.fingerprintKey, from.profile);
+    const context = this.completed.get(fromKey);
+    if (!context) return false;
+    const toKey = contextKey(to.artifactRef, to.fingerprintKey, to.profile ?? from.profile);
+    if (this.completed.admit(this.completed.sizeEstimateOf(context))) {
+      this.completed.set(toKey, context);
+    }
+    return true;
   }
 
   inFlightCount(): number {
@@ -158,8 +190,10 @@ export class ArtifactRegistry implements IArtifactRegistry {
     for (const [key] of Array.from(this.completed.entries())) {
       if (!this.isKeyHeldByInFlight(key)) this.completed.delete(key);
     }
-    for (const [format, runtime] of this.runtimes) {
-      await runtime.trimMemory(level).catch(() => void format);
+    for (const [format, byProfile] of this.runtimes) {
+      for (const runtime of Object.values(byProfile)) {
+        await runtime?.trimMemory(level).catch(() => void format);
+      }
     }
   }
 
@@ -183,9 +217,15 @@ export class ArtifactRegistry implements IArtifactRegistry {
     this.pathResolver = resolver;
   }
 
-  private leaseFor(context: ArtifactContext, consumer: string, reuseLeaseId?: string): ArtifactLease {
+  private leaseFor(
+    context: ArtifactContext,
+    consumer: string,
+    reuseLeaseId?: string,
+    contextKeyOf?: string
+  ): ArtifactLease {
     const leaseId = reuseLeaseId ?? newId("lease");
     this.leaseConsumers.set(leaseId, consumer);
+    this.leaseIndex.set(leaseId, { artifactRef: context.artifactRef, contextKey: contextKeyOf ?? "" });
     const self = this;
     return {
       leaseId,
@@ -193,6 +233,7 @@ export class ArtifactRegistry implements IArtifactRegistry {
       consumer,
       release(): void {
         self.leaseConsumers.delete(leaseId);
+        self.leaseIndex.delete(leaseId);
       }
     };
   }
@@ -202,6 +243,7 @@ export class ArtifactRegistry implements IArtifactRegistry {
     if (!entry) return;
     this.inflightConsumersByLease.delete(leaseId);
     this.leaseConsumers.delete(leaseId);
+    this.leaseIndex.delete(leaseId);
     const job = this.inFlight.get(entry.key);
     if (!job) return;
     job.consumers.delete(leaseId);
@@ -219,13 +261,15 @@ export class ArtifactRegistry implements IArtifactRegistry {
     }
     this.inFlight.clear();
     this.completed.clear();
-    for (const runtime of this.runtimes.values()) {
-      await runtime.dispose().catch(() => undefined);
+    for (const byProfile of this.runtimes.values()) {
+      for (const runtime of Object.values(byProfile)) {
+        await runtime?.dispose().catch(() => undefined);
+      }
     }
     this.runtimes.clear();
   }
 }
 
-export function contextKey(ref: ArtifactRef, fpKey: string, consistency: "optimistic" | "stable"): string {
-  return `${ref}|${fpKey}|${consistency === "stable" ? "s" : "o"}`;
+export function contextKey(ref: ArtifactRef, fpKey: string, profile: ArtifactContextProfile): string {
+  return `${ref}|${fpKey}|${profile === "full" ? "f" : "m"}`;
 }

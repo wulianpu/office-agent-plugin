@@ -19,6 +19,11 @@ export interface PreviewRequest {
   artifactRef: ArtifactRef;
   priority: PreviewPriority;
   scope?: PreviewScope;
+  /**
+   * P0-7: default previews stay at ZIP/index depth (first useful content,
+   * §28-30); `visual` upgrades to the full engine model + SVG slides.
+   */
+  visual?: boolean;
 }
 
 /** Headless render model consumed by preview surfaces. */

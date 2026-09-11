@@ -1,8 +1,12 @@
 /**
- * Edit Promotion (§13, §51): read-only session → first human mutation promotes
- * the same tab in place into an editor. Checks: stable source identity, no
- * competing candidate, write readiness, then human WriterLease acquisition and
- * editor activation. The triggering operation is replayed by the caller.
+ * Edit Promotion (§13, §51, P0-6): read-only session → first human mutation
+ * promotes the same tab in place into an editor.
+ *
+ * Three-phase actor discipline (§41–§43): the mailbox is held only for
+ * control steps; the strong hash runs outside the actor, and its result is
+ * applied back inside the actor only if still fresh.
+ *
+ *  Actor(capture) → Scheduler(hash) → Actor(apply if fresh)
  */
 
 import type { SessionId } from "../../contracts/ids.js";
@@ -35,6 +39,11 @@ export interface EditPromotionResult {
   bookmark?: ViewBookmark;
 }
 
+interface PromotionCapture {
+  epoch: number;
+  revisionId: string;
+}
+
 export async function promoteToEdit(
   deps: EditPromotionDeps,
   sessionId: SessionId,
@@ -44,10 +53,41 @@ export async function promoteToEdit(
   if (session.lifecycle !== "ready") {
     throw new OfficeRuntimeError("recovery-required", `session lifecycle is ${session.lifecycle}`);
   }
+
+  // Phase 1 — capture (inside actor, control-only).
+  const captured: PromotionCapture = await deps.sessions.actor(sessionId).enqueue(async () => {
+    const live = deps.sessions.require(sessionId);
+    return {
+      epoch: live.sessionEpoch,
+      revisionId: live.committedRevision.revisionId
+    };
+  });
+
+  // Phase 2 — dispatch (outside actor): strong identity + source hash.
+  // The mailbox stays free; concurrent control operations can interleave.
+  const revision = await deps.sessions.ensureStrongIdentity(sessionId);
+  const sourcePath = deps.store.resolvePath(session.artifactRef);
+  const currentHash = await deps.scheduler
+    .submit({
+      label: `promotion-hash:${sessionId}`,
+      priority: "EDIT_PROMOTION",
+      run: () => sha256File(sourcePath)
+    })
+    .promise;
+
+  // Phase 3 — apply (inside actor): validate freshness, then decide.
   return deps.sessions.actor(sessionId).enqueue(async () => {
     const live = deps.sessions.require(sessionId);
 
-    // 1. Competing candidate blocks promotion (§13).
+    // Freshness (§43): state moved during the hash — retryable, not applied.
+    if (live.sessionEpoch !== captured.epoch || live.committedRevision.revisionId !== revision.revisionId) {
+      throw new OfficeRuntimeError(
+        "recovery-required",
+        "session state changed during promotion; retry the edit"
+      );
+    }
+
+    // Competing candidate blocks promotion (§13).
     const active = deps.candidates.activeForSession(sessionId);
     if (active && active.state !== "failed") {
       throw new OfficeRuntimeError(
@@ -56,17 +96,8 @@ export async function promoteToEdit(
       );
     }
 
-    // 2. Source stability: hash must match the committed revision (§13).
-    const sourcePath = deps.store.resolvePath(live.artifactRef);
-    const currentHash = await deps.scheduler
-      .submit({
-        label: `promotion-hash:${sessionId}`,
-        priority: "EDIT_PROMOTION",
-        run: () => sha256File(sourcePath)
-      })
-      .promise;
+    // Source stability: hash must match the committed revision (§13).
     if (currentHash !== live.committedRevision.contentHash) {
-      live.lifecycle = "conflict";
       deps.sessions.updateSession(sessionId, (s) => {
         s.lifecycle = "conflict";
       });
@@ -81,15 +112,20 @@ export async function promoteToEdit(
       );
     }
 
-    // 3. Write readiness achieved by the hash check above (§52).
-    deps.sessions.setReadiness(sessionId, { readiness: "ready", strongHash: currentHash, probedAt: Date.now() });
+    // Write readiness achieved by the hash check above (§52).
+    deps.sessions.setReadiness(sessionId, {
+      readiness: "ready",
+      strongHash: currentHash,
+      probedAt: Date.now()
+    });
 
-    // 4. Acquire the human lease (§13).
+    // Acquire the human lease (§13, P0-4 document scope).
     const lease = deps.leases.acquire(sessionId, live.sessionEpoch, {
       sessionId,
       owner: "human",
       backend: "genoffice",
-      baseRevisionId: live.committedRevision.revisionId
+      baseRevisionId: live.committedRevision.revisionId,
+      sourcePath
     });
     await deps.events.emit(sessionId, live.sessionEpoch, "lease.acquired", {
       leaseId: lease.leaseId,

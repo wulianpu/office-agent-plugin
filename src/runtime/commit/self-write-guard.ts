@@ -49,7 +49,7 @@ export class SelfWriteGuardRegistry {
  */
 
 import { watch, type FSWatcher } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 export interface SourceMutationEvent {
   sourcePath: string;
@@ -57,24 +57,54 @@ export interface SourceMutationEvent {
 }
 
 export class SourceWatcher {
-  private watcher?: FSWatcher;
+  /**
+   * Directory watchers with ref-counted path sets (P0-3): one FSWatcher per
+   * directory covers every watched file inside it; watching and unwatching
+   * are per-file and independent.
+   */
+  private readonly dirs = new Map<string, { watcher: FSWatcher; paths: Set<string> }>();
   private readonly listeners = new Set<(event: SourceMutationEvent) => void>();
   private pending = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly selfWrites: SelfWriteGuardRegistry) {}
 
   watchFile(sourcePath: string): void {
-    if (this.watcher) return;
-    const dir = dirname(sourcePath);
-    try {
-      this.watcher = watch(dir, (event, filename) => {
-        if (event !== "change" && event !== "rename") return;
-        const name = filename ? String(filename) : "";
-        if (!name || !sourcePath.endsWith(name)) return;
-        this.schedule(sourcePath);
-      });
-    } catch {
-      // Watchers are best-effort; conflict detection falls back to hash checks.
+    const canonical = resolve(sourcePath);
+    const dir = dirname(canonical);
+    let entry = this.dirs.get(dir);
+    if (!entry) {
+      try {
+        const watcher = watch(dir, (event, filename) => {
+          if (event !== "change" && event !== "rename") return;
+          const name = filename ? String(filename) : "";
+          if (!name) return;
+          const changed = resolve(dir, name);
+          if (this.dirs.get(dir)?.paths.has(changed)) this.schedule(changed);
+        });
+        entry = { watcher, paths: new Set() };
+        this.dirs.set(dir, entry);
+      } catch {
+        // Watchers are best-effort; conflict detection falls back to hash checks.
+        return;
+      }
+    }
+    entry.paths.add(canonical);
+  }
+
+  unwatchFile(sourcePath: string): void {
+    const canonical = resolve(sourcePath);
+    const dir = dirname(canonical);
+    const entry = this.dirs.get(dir);
+    if (!entry) return;
+    entry.paths.delete(canonical);
+    if (entry.paths.size === 0) {
+      entry.watcher.close();
+      this.dirs.delete(dir);
+    }
+    const timer = this.pending.get(canonical);
+    if (timer) {
+      clearTimeout(timer);
+      this.pending.delete(canonical);
     }
   }
 
@@ -89,6 +119,7 @@ export class SourceWatcher {
   }
 
   private async dispatch(sourcePath: string): Promise<void> {
+    sourcePath = resolve(sourcePath);
     if (await this.selfWrites.isSelfWrite(sourcePath)) {
       for (const listener of this.listeners) listener({ sourcePath, kind: "self-write" });
       return;
@@ -102,7 +133,8 @@ export class SourceWatcher {
   }
 
   dispose(): void {
-    this.watcher?.close();
+    for (const entry of this.dirs.values()) entry.watcher.close();
+    this.dirs.clear();
     for (const timer of this.pending.values()) clearTimeout(timer);
     this.pending.clear();
   }
