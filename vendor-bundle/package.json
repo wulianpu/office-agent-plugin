@@ -1,0 +1,11 @@
+{
+  "name": "genoffice-vendor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./pptx-engine.mjs": "./pptx-engine.mjs",
+    "./docx-engine.mjs": "./docx-engine.mjs",
+    "./pptx-render.mjs": "./pptx-render.mjs"
+  }
+}

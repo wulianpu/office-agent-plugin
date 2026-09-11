@@ -1,0 +1,47 @@
+{
+  "name": "@harness/office-plugin",
+  "version": "3.0.0",
+  "description": "Local, transactional, read-optimized Office Runtime Plugin (DOCX/XLSX/PPTX) for Harness Desktop",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "./dist/plugin/office-plugin.js",
+  "types": "./dist/plugin/office-plugin.d.ts",
+  "bin": {
+    "office-runtime": "./dist/cli/main.js",
+    "office-mcp": "./dist/mcp/launch.js"
+  },
+  "exports": {
+    ".": "./dist/plugin/office-plugin.js",
+    "./contracts": "./dist/contracts/index.js"
+  },
+  "scripts": {
+    "build": "npm run build:vendor && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.check.json --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "bench": "npm run build && node tools/bench/run.mjs",
+    "corpus": "node tools/corpus/generate.mjs",
+    "demo": "npm run build && node dist/cli/main.js",
+    "build:vendor": "node tools/vendor/build-vendor.mjs",
+    "sidecar:build": "node tools/vendor/build-sidecar.mjs",
+    "host": "npm run build && node dist/host/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "bidi-js": "^1.1.0",
+    "fast-xml-parser": "^5.11.1",
+    "genoffice-vendor": "file:vendor-bundle",
+    "jszip": "^3.10.2",
+    "opentype.js": "^2.0.0",
+    "sharp": "^0.35.4",
+    "utif2": "^4.1.0"
+  }
+}

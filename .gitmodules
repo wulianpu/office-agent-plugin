@@ -1,0 +1,3 @@
+[submodule "vendor/genoffice"]
+	path = vendor/genoffice
+	url = https://github.com/genspark-ai/genoffice

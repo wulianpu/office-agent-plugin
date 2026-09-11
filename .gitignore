@@ -1,0 +1,13 @@
+node_modules/
+dist/
+# GenOffice engine bundles (rebuilt via npm run build:vendor; manifest stays)
+vendor-bundle/*.mjs
+vendor-bundle/*.mjs.map
+# Golden corpus & runtime workspaces (generated)
+.corpus/
+.office-runtime/
+.office-runtime*/
+*.log
+# Scratch outputs
+host-slide.png
+slide1-preview.svg
