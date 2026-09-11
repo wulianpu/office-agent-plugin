@@ -646,6 +646,34 @@ export class OfficeRuntimeService {
     return this.genoffice[format];
   }
 
+  /**
+   * §125 live snapshot: the officecli schema fingerprint is derived from the
+   * engine's own capability-reference surface (help output digest), so a
+   * silent engine upgrade changes the lock the runtime reports.
+   */
+  async probeCompatibilitySnapshot(): Promise<{
+    plugin: string;
+    genoffice: string;
+    officecli: { version: string; schemaFingerprint: string };
+    contract: number;
+    dbSchema: number;
+  }> {
+    const lock = (await import("../../plugin/office-plugin.js")).COMPATIBILITY_LOCK;
+    if (!this.engineAvailable) return lock;
+    try {
+      const { createHash } = await import("node:crypto");
+      const help = await this.officecli.run(["help", "--json"]).catch(() => undefined);
+      const text = help ? JSON.stringify(help).slice(0, 262_144) : "";
+      const version = await this.officecli.version_().catch(() => "unknown");
+      const fingerprint = text
+        ? createHash("sha256").update(text).digest("hex").slice(0, 16)
+        : "unavailable";
+      return { ...lock, officecli: { version, schemaFingerprint: fingerprint } };
+    } catch {
+      return lock;
+    }
+  }
+
   /** §30: Rust sidecar availability for XLSX (capability matrix input). */
   isXlsxSidecarAvailable(): boolean {
     return this.xlsxSidecar.available;

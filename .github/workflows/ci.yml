@@ -18,11 +18,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Install OfficeCLI
+      - name: Install OfficeCLI (non-fatal; suites self-skip without it)
         shell: pwsh
+        continue-on-error: true
         run: npm install -g @officecli/officecli
       - name: Install
-        run: npm install
+        run: npm ci
       - name: Build vendor bundles
         run: npm run build:vendor
       - name: Check (src + tests)
@@ -44,12 +45,12 @@ jobs:
         with:
           node-version: 24
       - name: Install
-        run: npm install
+        run: npm ci
       - name: Build vendor bundles
         run: npm run build:vendor
       - name: Check (src + tests)
         run: npm run check
       - name: Unit tests
         run: npm run test:unit
-      - name: Hermetic integration (probes skip engine suites)
-        run: npx vitest run test/integration/read-path.test.ts test/integration/crash-recovery.test.ts test/integration/source-watcher.test.ts test/integration/mcp-server.test.ts || true
+      - name: Integration (engine suites self-skip via probes)
+        run: npm run test:integration

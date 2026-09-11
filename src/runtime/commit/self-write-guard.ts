@@ -62,7 +62,7 @@ export class SourceWatcher {
    * directory covers every watched file inside it; watching and unwatching
    * are per-file and independent.
    */
-  private readonly dirs = new Map<string, { watcher: FSWatcher; paths: Set<string> }>();
+  private readonly dirs = new Map<string, { watcher: FSWatcher; paths: Map<string, number> }>();
   private readonly listeners = new Set<(event: SourceMutationEvent) => void>();
   private pending = new Map<string, NodeJS.Timeout>();
 
@@ -79,16 +79,16 @@ export class SourceWatcher {
           const name = filename ? String(filename) : "";
           if (!name) return;
           const changed = resolve(dir, name);
-          if (this.dirs.get(dir)?.paths.has(changed)) this.schedule(changed);
+          if ((this.dirs.get(dir)?.paths.get(changed) ?? 0) > 0) this.schedule(changed);
         });
-        entry = { watcher, paths: new Set() };
+        entry = { watcher, paths: new Map() };
         this.dirs.set(dir, entry);
       } catch {
         // Watchers are best-effort; conflict detection falls back to hash checks.
         return;
       }
     }
-    entry.paths.add(canonical);
+    entry.paths.set(canonical, (entry.paths.get(canonical) ?? 0) + 1);
   }
 
   unwatchFile(sourcePath: string): void {
@@ -96,15 +96,20 @@ export class SourceWatcher {
     const dir = dirname(canonical);
     const entry = this.dirs.get(dir);
     if (!entry) return;
-    entry.paths.delete(canonical);
+    const count = entry.paths.get(canonical) ?? 0;
+    if (count <= 1) {
+      entry.paths.delete(canonical);
+      const timer = this.pending.get(canonical);
+      if (timer) {
+        clearTimeout(timer);
+        this.pending.delete(canonical);
+      }
+    } else {
+      entry.paths.set(canonical, count - 1);
+    }
     if (entry.paths.size === 0) {
       entry.watcher.close();
       this.dirs.delete(dir);
-    }
-    const timer = this.pending.get(canonical);
-    if (timer) {
-      clearTimeout(timer);
-      this.pending.delete(canonical);
     }
   }
 

@@ -13,6 +13,14 @@ import { createOfficeCliFixture } from "../helpers/officecli-fixture.js";
 
 let ws: Awaited<ReturnType<typeof openWorkspace>>;
 let fixture: Awaited<ReturnType<typeof createOfficeCliFixture>>;
+/** CI without the OfficeCLI engine: the whole suite skips cleanly. */
+const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
+  .then(async (m) => {
+    const probe = new m.OfficeCliAdapter();
+    return probe.version_().then(() => true).catch(() => false);
+  })
+  .catch(() => false);
+
 
 /** The large corpus file is the sidecar's meaningful workload; build on demand. */
 async function ensureLargeCorpus(): Promise<string> {
@@ -33,7 +41,7 @@ afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
-describe("pptx headless visual rendering (§P7)", () => {
+describe.skipIf(!engineUp)("pptx headless visual rendering (§P7)", () => {
   it("previews embed standalone SVG slides containing laid-out text", async () => {
     const pptx = await fixture.pptx(ws.root, "visual.pptx");
     const ref = await ws.plugin.registerArtifact(pptx);
@@ -61,7 +69,7 @@ describe("pptx headless visual rendering (§P7)", () => {
   });
 });
 
-describe("xlsx Rust sidecar (§30)", () => {
+describe.skipIf(!engineUp)("xlsx Rust sidecar (§30)", () => {
   it("sidecar binary is built and reachable", () => {
     expect(ws.plugin.service.isXlsxSidecarAvailable()).toBe(true);
   });

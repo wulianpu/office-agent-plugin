@@ -25,6 +25,11 @@ export interface EditorBootstrapContext {
 }
 
 export interface EditorSaveResult {
+  /**
+   * P1: staging artifact produced by the editor's save. The runtime commits
+   * THROUGH the atomic committer — editors never write the source in place.
+   */
+  outputArtifactRef?: import("./ids.js").ArtifactRef;
   /** Artifact content hash after save, when the save flushed bytes. */
   contentHash?: string;
   savedAt: number;

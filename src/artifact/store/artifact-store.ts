@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import {
   newArtifactRef
 } from "../../support/ids.js";
-import { cloneFile, ensureDir, pathExists, removeQuiet } from "../../support/fsx.js";
+import { canonicalSourceKey, cloneFile, ensureDir, pathExists, removeQuiet } from "../../support/fsx.js";
 import type { ArtifactRef, OfficeFormat } from "../../contracts/ids.js";
 import { formatFromPath } from "../../contracts/ids.js";
 import { OfficeRuntimeError } from "../../contracts/document.js";
@@ -57,12 +57,12 @@ export class ArtifactStore {
     if (!(await pathExists(abs))) {
       throw new OfficeRuntimeError("artifact-missing", `artifact source missing: ${abs}`);
     }
-    const existing = this.byPath.get(abs);
+    const existing = this.byPath.get(canonicalSourceKey(abs));
     if (existing) return existing;
 
     const ref = newArtifactRef();
     this.byRef.set(ref, { ref, path: abs, kind: "source", format });
-    this.byPath.set(abs, ref);
+    this.byPath.set(canonicalSourceKey(abs), ref);
     await this.persistence?.saveArtifact({ ref, path: abs, kind: "source", format });
     return ref;
   }
@@ -90,7 +90,7 @@ export class ArtifactStore {
 
   /** Reverse lookup used by crash recovery (journal records physical paths). */
   tryResolveRefByPath(path: string): ArtifactRef | undefined {
-    return this.byPath.get(resolve(path));
+    return this.byPath.get(canonicalSourceKey(path));
   }
 
   /**
@@ -116,11 +116,11 @@ export class ArtifactStore {
   /** Register a staging file that already exists (e.g. produced by OfficeCLI create). */
   async registerStagingFile(path: string, format: OfficeFormat): Promise<ArtifactRef> {
     const abs = resolve(path);
-    const existing = this.byPath.get(abs);
+    const existing = this.byPath.get(canonicalSourceKey(abs));
     if (existing) return existing;
     const ref = newArtifactRef();
     this.byRef.set(ref, { ref, path: abs, kind: "staging", format });
-    this.byPath.set(abs, ref);
+    this.byPath.set(canonicalSourceKey(abs), ref);
     await this.persistence?.saveArtifact({ ref, path: abs, kind: "staging", format });
     return ref;
   }
@@ -155,7 +155,7 @@ export class ArtifactStore {
       }
     }
     this.byRef.delete(ref);
-    this.byPath.delete(artifact.path);
+    this.byPath.delete(canonicalSourceKey(artifact.path));
     await this.persistence?.deleteArtifact(ref);
   }
 

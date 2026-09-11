@@ -12,6 +12,14 @@ import { createOfficeCliFixture } from "../helpers/officecli-fixture.js";
 
 let ws: Awaited<ReturnType<typeof openWorkspace>>;
 let fixture: Awaited<ReturnType<typeof createOfficeCliFixture>>;
+/** CI without the OfficeCLI engine: the whole suite skips cleanly. */
+const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
+  .then(async (m) => {
+    const probe = new m.OfficeCliAdapter();
+    return probe.version_().then(() => true).catch(() => false);
+  })
+  .catch(() => false);
+
 let host: PreviewHost;
 let base: string;
 let pptxRef: string;
@@ -34,7 +42,7 @@ afterAll(async () => {
   await ws?.cleanup().catch(() => undefined);
 });
 
-describe("localhost preview host", () => {
+describe.skipIf(!engineUp)("localhost preview host", () => {
   it("serves the gallery page", async () => {
     const res = await fetch(base + "/");
     expect(res.status).toBe(200);
@@ -88,7 +96,7 @@ describe("localhost preview host", () => {
   });
 });
 
-describe("L5 pixel rendering (verification upgrade)", () => {
+describe.skipIf(!engineUp)("L5 pixel rendering (verification upgrade)", () => {
   it("changed-scope pptx slides rasterize to non-trivial pixels", async () => {
     const session = await ws.plugin.openSession(pptxRef);
     const task = await ws.plugin.beginAgentTask(session.sessionId, {

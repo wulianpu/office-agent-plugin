@@ -65,6 +65,22 @@ describe("SourceWatcher multi-document (P0-3)", () => {
     await ws.plugin.closeSession(sessionA.sessionId);
   }, 30_000);
 
+  it("P0-C: two sessions on the SAME file — closing one keeps the other watched", async () => {
+    const ref = await ws.plugin.registerArtifact(fileA);
+    const sessionOne = await ws.plugin.openSession(ref);
+    const sessionTwo = await ws.plugin.openSession(ref);
+
+    // Close ONE of the two sessions; the shared path must stay watched.
+    await ws.plugin.closeSession(sessionOne.sessionId);
+    await appendFile(fileA, "z");
+
+    const conflicted = await waitFor(
+      () => ws.plugin.service.getSession(sessionTwo.sessionId)?.lifecycle === "conflict"
+    );
+    expect(conflicted).toBe(true);
+    await ws.plugin.closeSession(sessionTwo.sessionId);
+  }, 30_000);
+
   it("unwatch on close: later mutations do not resurrect conflict state", async () => {
     const ref = await ws.plugin.registerArtifact(fileA);
     const session = await ws.plugin.openSession(ref);

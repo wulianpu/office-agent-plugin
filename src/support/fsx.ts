@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import {
   copyFile,
   mkdir,
@@ -44,6 +45,55 @@ export async function fileFingerprint(path: string): Promise<FileFingerprint> {
 
 export function fingerprintKey(fp: FileFingerprint): string {
   return `${fp.size.toString()}:${fp.mtimeNs.toString()}:${fp.fileId ?? "-"}`;
+}
+
+/**
+ * P0-B (§17/§18 stable path): hash a file only if its identity is stable
+ * across the read — fingerprint before → SHA-256 → fingerprint after.
+ * A concurrent writer yields null (caller retries or flags a conflict);
+ * the hash is never a hybrid of two file states.
+ */
+export async function stableHashFile(
+  path: string,
+  attempts = 3
+): Promise<{ hash: string; fingerprint: FileFingerprint } | null> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const before = await fileFingerprint(path);
+    const hash = await sha256File(path);
+    const after = await fileFingerprint(path);
+    if (fingerprintKey(before) === fingerprintKey(after)) {
+      return { hash, fingerprint: after };
+    }
+  }
+  return null;
+}
+
+/**
+ * P1: canonical source identity for document-scoped keys (writer lease,
+ * store byPath): native realpath (symlinks/junctions resolved), Windows
+ * case-folding, and dev/inode when the platform reports a real one.
+ */
+export function canonicalSourceKey(path: string): string {
+  let real = path;
+  try {
+    real = realpathSync.native(path);
+  } catch {
+    try {
+      real = realpathSync(path);
+    } catch {
+      // Missing file: fall back to the raw path.
+    }
+  }
+  let key = process.platform === "win32" ? real.toLowerCase() : real;
+  try {
+    const st = statSync(real);
+    if (st.dev !== undefined && st.ino !== undefined && st.ino !== 0) {
+      key += `#f${st.dev.toString(36)}-${st.ino.toString(36)}`;
+    }
+  } catch {
+    // Identity from path alone is acceptable when stat fails.
+  }
+  return key;
 }
 
 export async function sha256File(path: string): Promise<string> {

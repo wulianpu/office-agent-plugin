@@ -79,6 +79,14 @@ export async function promoteToEdit(
   return deps.sessions.actor(sessionId).enqueue(async () => {
     const live = deps.sessions.require(sessionId);
 
+    // P0-B four-way writer gate: lifecycle + epoch + revision + source hash.
+    if (live.lifecycle !== "ready") {
+      throw new OfficeRuntimeError(
+        "recovery-required",
+        `session lifecycle is ${live.lifecycle}; writer cannot start`
+      );
+    }
+
     // Freshness (§43): state moved during the hash — retryable, not applied.
     if (live.sessionEpoch !== captured.epoch || live.committedRevision.revisionId !== revision.revisionId) {
       throw new OfficeRuntimeError(

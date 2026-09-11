@@ -16,6 +16,25 @@ export class RevisionLog {
     return (latest?.sequence ?? 0) + 1;
   }
 
+  /** Reserve id+sequence WITHOUT inserting — the insert happens atomically
+   *  with the journal flip (P0-A, repos.finalizeCommitAtomically). */
+  prepare(params: {
+    sessionId: SessionId;
+    artifactRef: ArtifactRef;
+    contentHash: string;
+    origin: RevisionOrigin;
+  }): CommittedRevision {
+    return {
+      revisionId: newRevisionId(),
+      sessionId: params.sessionId,
+      sequence: this.nextSequence(params.sessionId),
+      artifactRef: params.artifactRef,
+      contentHash: params.contentHash,
+      origin: params.origin,
+      createdAt: Date.now()
+    };
+  }
+
   commit(params: {
     sessionId: SessionId;
     artifactRef: ArtifactRef;

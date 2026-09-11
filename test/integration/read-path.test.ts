@@ -81,8 +81,11 @@ describe("Read path (§157, PERF-01/02/03)", () => {
     expect(session.lifecycle).toBe("ready");
     expect(session.writerLease).toBeUndefined();
     expect(session.candidate).toBeUndefined();
+    // P0-6: open returns with an optimistic placeholder; the strong identity
+    // binds in the background and writer paths await it (§52).
+    const strong = await ws.plugin.service.sessions.ensureStrongIdentity(session.sessionId);
     const hash = await sha256File(docxPath);
-    expect(session.committedRevision.contentHash).toBe(hash);
+    expect(strong.contentHash).toBe(hash);
     await ws.plugin.closeSession(session.sessionId);
   });
 

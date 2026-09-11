@@ -10,6 +10,7 @@ import { FencedError } from "../../contracts/lease.js";
 import { OfficeRuntimeError } from "../../contracts/document.js";
 import { newLeaseId } from "../../support/ids.js";
 import { resolve } from "node:path";
+import { canonicalSourceKey } from "../../support/fsx.js";
 import type { RuntimeRepositories } from "../persistence/repositories.js";
 
 export class LeaseManager {
@@ -44,7 +45,7 @@ export class LeaseManager {
         `session ${sessionId} already has an active ${existing.owner} writer (lease ${existing.leaseId})`
       );
     }
-    const sourceKey = resolve(input.sourcePath);
+    const sourceKey = canonicalSourceKey(input.sourcePath);
     const documentWriter = this.bySource.get(sourceKey);
     if (documentWriter) {
       throw new OfficeRuntimeError(

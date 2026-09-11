@@ -40,6 +40,18 @@ export interface ScheduledHandle<T> {
   cancel(): void;
 }
 
+function resourcesToRequest(
+  resources: NonNullable<SchedulerJob<unknown>["resources"]>,
+  label: string
+): { classes: Record<string, number>; bytes?: number; label: string } {
+  const classes: Record<string, number> = {};
+  if (resources.cpu) classes.cpu = resources.cpu;
+  if (resources.io) classes.io = resources.io;
+  if (resources.render) classes.render = resources.render;
+  if (resources.nativeProcess) classes["native-process"] = resources.nativeProcess;
+  return { classes, bytes: resources.estimatedBytes, label: `job:${label}` };
+}
+
 const PRIORITY_INDEX = new Map<SchedulerPriorityName, number>(
   SCHEDULER_PRIORITIES.map((name, index) => [name, index])
 );
@@ -75,6 +87,10 @@ export class Scheduler {
     this.maxConcurrent = options.maxConcurrent ?? 8;
     this.maxQueuePerPriority = options.maxQueuePerPriority ?? 256;
     this.governor = options.governor;
+    // Resources freed outside this scheduler (e.g. sidecar leases) must
+    // re-kick the pump so blocked jobs get their chance — on EVERY release,
+    // not only pressure-level transitions.
+    this.governor?.onRelease(() => this.pump());
   }
 
   submit<T>(job: SchedulerJob<T>): ScheduledHandle<T> {
@@ -147,17 +163,62 @@ export class Scheduler {
     return this.running;
   }
 
+  /**
+   * P1-high-C: governor-aware dispatch. A job that only WAITS for resources
+   * must not occupy a running slot (priority inversion: 8 blocked background
+   * jobs would starve INTERACTIVE). The pump scans in priority order for the
+   * first job whose resources are acquirable NOW; blocked jobs stay queued.
+   */
+  private pumping = false;
+
   private pump(): void {
-    while (this.running < this.maxConcurrent && this.queue.length > 0) {
-      const next = this.queue.shift()!;
-      if (next.abort.signal.aborted) continue;
-      this.running++;
-      this.stats.started++;
-      void this.execute(next);
+    // Re-entrancy guard: tryAcquire can synchronously fire pressure-change
+    // listeners that call pump() again — the nested call must not splice
+    // entries the outer scan is about to pick. The outer loop (or a finally)
+    // re-drives once done.
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      this.pumpInner();
+    } finally {
+      this.pumping = false;
     }
   }
 
-  private async execute(queued: QueuedJob): Promise<void> {
+  private pumpInner(): void {
+    while (this.running < this.maxConcurrent && this.queue.length > 0) {
+      let pickedIndex = -1;
+      let pickedLease: ReturnType<ResourceGovernor["tryAcquire"]> = undefined;
+      for (let i = 0; i < this.queue.length; i++) {
+        const candidate = this.queue[i]!;
+        if (candidate.abort.signal.aborted) {
+          this.queue.splice(i, 1);
+          this.stats.cancelled++;
+          candidate.reject(new DOMException("cancelled", "AbortError"));
+          i--;
+          continue;
+        }
+        if (!candidate.job.resources || !this.governor) {
+          pickedIndex = i;
+          break;
+        }
+        const lease = this.governor.tryAcquire(resourcesToRequest(candidate.job.resources, candidate.job.label));
+        if (lease) {
+          pickedIndex = i;
+          pickedLease = lease;
+          break;
+        }
+        // Blocked at this priority — keep scanning lower priorities.
+      }
+      if (pickedIndex < 0) return; // every queued job is resource-blocked
+      const next = this.queue.splice(pickedIndex, 1)[0]!;
+      this.running++;
+      this.stats.started++;
+      void this.execute(next, pickedLease ?? undefined);
+    }
+  }
+
+  private async execute(queued: QueuedJob, preAcquiredLease?: NonNullable<ReturnType<ResourceGovernor["tryAcquire"]>>): Promise<void> {
     const { job } = queued;
     const staleBefore = this.isStale(job);
     if (staleBefore) {
@@ -169,19 +230,9 @@ export class Scheduler {
       this.pump();
       return;
     }
-    // P1e: real budget enforcement — the governor lease spans execution.
-    const lease = job.resources
-      ? await this.governor?.acquire({
-          classes: {
-            ...(job.resources.cpu ? { cpu: job.resources.cpu } : {}),
-            ...(job.resources.io ? { io: job.resources.io } : {}),
-            ...(job.resources.render ? { render: job.resources.render } : {}),
-            ...(job.resources.nativeProcess ? { "native-process": job.resources.nativeProcess } : {})
-          },
-          bytes: job.resources.estimatedBytes,
-          label: `job:${job.label}`
-        })
-      : undefined;
+    // P1e/P1-high-C: the pump pre-acquired resource leases; a job WITHOUT
+    // resources (or when no governor is attached) runs lease-free.
+    const lease = preAcquiredLease;
     try {
       const result = await job.run(queued.abort.signal);
       if (this.isStale(job)) {

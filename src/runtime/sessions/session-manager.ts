@@ -38,6 +38,9 @@ export class SessionManager {
   private readonly sessions = new Map<SessionId, { session: DocumentSession; actor: SessionActor; readiness: WriteReadinessState }>();
   /** Background strong-identity promises per session (P0-6 §52). */
   private readonly strongIdentity = new Map<SessionId, Promise<CommittedRevision>>();
+  /** P0-B: conflict watcher — installed by the service BEFORE open() so the
+   *  background hash never races a missed filesystem event. */
+  onSourceMutated?: (sourcePath: string, kind: "self-write" | "external") => void;
 
   constructor(
     private readonly store: ArtifactStore,
@@ -106,27 +109,62 @@ export class SessionManager {
       createdAt: session.createdAt
     });
 
-    // Background strong hash → real committed revision (§52 Write Readiness).
+    // Background strong identity (§52). P0-B hardening:
+    //  * watcher installed BEFORE hashing starts (no missed-event window);
+    //  * stable hash — fingerprint before/after guards against hybrid reads;
+    //  * a closed session never persists an orphan revision.
     const strong = (async () => {
-      const sourceHash = await this.scheduler
+      const sourcePath = this.store.resolvePath(artifactRef);
+      const stable = await this.scheduler
         .submit({
           label: `open-hash:${sessionId}`,
           priority: "EDIT_PROMOTION",
-          run: () => this.scanner.hashOnly(this.store.resolvePath(artifactRef))
+          resources: { io: 1 },
+          run: async () => {
+            const { stableHashFile } = await import("../../support/fsx.js");
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const result = await stableHashFile(sourcePath);
+              if (result) return result;
+            }
+            return null;
+          }
         })
         .promise;
-      const revision = this.revisions.commit({
+      if (!stable) {
+        // File keeps moving under us — surface as a conflict, not a bad hash.
+        const live = this.sessions.get(sessionId);
+        if (live) {
+          this.updateSession(sessionId, (s) => {
+            s.lifecycle = s.lifecycle === "ready" ? "conflict" : s.lifecycle;
+          });
+          await this.events
+            .emit(sessionId, 1, "session.conflict", { reason: "unstable-source-identity" })
+            .catch(() => undefined);
+        }
+        throw new OfficeRuntimeError("source-mutated", "source identity never stabilized during open");
+      }
+      // Session closed before the hash landed → discard, never an orphan row.
+      if (!this.sessions.has(sessionId)) {
+        return this.revisions.prepare({
+          sessionId,
+          artifactRef,
+          contentHash: stable.hash,
+          origin: "external"
+        });
+      }
+      const revision = this.revisions.prepare({
         sessionId,
         artifactRef,
-        contentHash: sourceHash,
+        contentHash: stable.hash,
         origin: "external"
       });
+      this.repos.insertRevision(revision);
       const live = this.sessions.get(sessionId);
       if (live && !live.session.committedRevision.contentHash) {
         this.updateSession(sessionId, (s) => {
           s.committedRevision = revision;
         });
-        this.setReadiness(sessionId, { readiness: "ready", strongHash: sourceHash, probedAt: Date.now() });
+        this.setReadiness(sessionId, { readiness: "ready", strongHash: stable.hash, probedAt: Date.now() });
       }
       return revision;
     })();

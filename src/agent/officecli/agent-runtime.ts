@@ -126,6 +126,14 @@ export class AgentRuntime {
 
     return this.deps.sessions.actor(sessionId).enqueue(async () => {
       const live = this.deps.sessions.require(sessionId);
+      // P0-B four-way gate at the final apply: lifecycle must still be ready.
+      if (live.lifecycle !== "ready") {
+        this.deps.leases.release(lease.leaseId);
+        this.deps.sessions.updateSession(sessionId, (s) => {
+          s.writerLease = undefined;
+        });
+        throw new OfficeRuntimeError("recovery-required", `session lifecycle is ${live.lifecycle}; task aborted`);
+      }
       if (live.committedRevision.revisionId !== captured.revisionId || live.sessionEpoch !== captured.epoch) {
         this.deps.leases.release(lease.leaseId);
         this.deps.sessions.updateSession(sessionId, (s) => {

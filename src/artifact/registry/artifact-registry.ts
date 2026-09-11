@@ -170,8 +170,20 @@ export class ArtifactRegistry implements IArtifactRegistry {
     const context = this.completed.get(fromKey);
     if (!context) return false;
     const toKey = contextKey(to.artifactRef, to.fingerprintKey, to.profile ?? from.profile);
-    if (this.completed.admit(this.completed.sizeEstimateOf(context))) {
-      this.completed.set(toKey, context);
+    // P1-high-A: REBIND, never alias. A new identity wrapper carries the
+    // SOURCE artifactRef (consumers resolvePath(context.artifactRef)); the
+    // underlying parsed engine model inside `enrichment` stays shared, so
+    // promotion still costs zero reparse. The wrapper itself is cheap — the
+    // heavy bytes were billed once under the original key.
+    const rebound: ArtifactContext = {
+      ...context,
+      artifactRef: to.artifactRef,
+      version: { ...context.version, artifactRef: to.artifactRef },
+      lastAccessAt: Date.now(),
+      estimatedResidentBytes: 4_096
+    };
+    if (this.completed.admit(4_096)) {
+      this.completed.set(toKey, rebound);
     }
     return true;
   }
@@ -197,8 +209,13 @@ export class ArtifactRegistry implements IArtifactRegistry {
     }
   }
 
-  private isKeyHeldByInFlight(_key: string): boolean {
-    return false; // completed contexts are immutable; safe to drop while readers hold their lease object
+  /** P1-high-B: a cache key pinned by ANY live lease must not be evicted —
+   *  dropping it forces a duplicate rebuild next to the still-held context. */
+  private isKeyHeldByInFlight(key: string): boolean {
+    for (const indexed of this.leaseIndex.values()) {
+      if (indexed.contextKey === key) return true;
+    }
+    return false;
   }
 
   private async fingerprintFor(ref: ArtifactRef): Promise<string> {

@@ -380,6 +380,51 @@ export class RuntimeRepositories
 
   // ---- commit journal ----
 
+  /**
+   * P0-A (§76): revision insert and journal FINALIZED flip share ONE SQLite
+   * transaction. A crash between source-replace and this call leaves the
+   * journal at SOURCE_REPLACED (unresolved → forward-recoverable); after the
+   * transaction both facts exist together. No window where the journal says
+   * finalized while the revision row is missing.
+   */
+  finalizeCommitAtomically(revision: CommittedRevision, journal: CommitJournalRecord): void {
+    this.rtdb.withTransaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO revisions (revision_id, session_id, sequence, artifact_ref, content_hash, origin, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          revision.revisionId,
+          revision.sessionId,
+          revision.sequence,
+          revision.artifactRef,
+          revision.contentHash,
+          revision.origin,
+          revision.createdAt
+        );
+      this.db
+        .prepare(
+          `INSERT INTO commit_journal (commit_id, session_id, candidate_id, source_path, temp_path, source_hash_before, candidate_hash, phase, origin, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(commit_id) DO UPDATE SET phase = excluded.phase, updated_at = excluded.updated_at`
+        )
+        .run(
+          journal.commitId,
+          journal.sessionId,
+          journal.candidateId,
+          journal.sourcePath,
+          journal.tempPath,
+          journal.sourceHashBefore,
+          journal.candidateHash,
+          "finalized",
+          journal.origin,
+          journal.createdAt,
+          Date.now()
+        );
+    });
+  }
+
   upsertJournal(record: CommitJournalRecord): void {
     this.db
       .prepare(

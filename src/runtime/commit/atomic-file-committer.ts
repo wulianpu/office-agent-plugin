@@ -131,14 +131,16 @@ export class AtomicFileCommitter {
       );
     }
 
-    await this.journal(record, "finalized");
-
-    const revision = this.revisions.commit({
+    // P0-A: build the revision, then land revision-insert + journal
+    // FINALIZED in ONE transaction (see finalizeCommitAtomically). The
+    // durable event fires only after both facts are on disk.
+    const revision = this.revisions.prepare({
       sessionId: request.sessionId,
       artifactRef: request.sessionArtifactRef,
       contentHash: replacedHash,
       origin: request.origin
     });
+    this.repos.finalizeCommitAtomically(revision, record);
 
     this.selfWrites.register({
       commitId,

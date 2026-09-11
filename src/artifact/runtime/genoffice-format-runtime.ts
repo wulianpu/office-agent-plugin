@@ -21,9 +21,13 @@ import type { DocxBlock, ParsedDocx, PptxDeck } from "../../vendor/genoffice/wra
 
 export const GENOFFICE_RENDERER_VERSION = "genoffice-1";
 
-/** Parsed models are attached to contexts via WeakMap (§25 progressive enrichment). */
-const deckByContext = new WeakMap<ArtifactContext, PptxDeck>();
-const docByContext = new WeakMap<ArtifactContext, ParsedDocx>();
+/**
+ * Parsed models ride INSIDE the context enrichment (§25): identity wrappers
+ * can be rebound on promotion while the underlying engine model stays shared
+ * — no WeakMap identity trap (P1-high-A).
+ */
+const DECK_KEY = "genoffice:deck";
+const DOC_KEY = "genoffice:doc";
 
 export class GenOfficePptxFormatRuntime implements FormatRuntime {
   readonly format = "pptx" as const;
@@ -69,10 +73,10 @@ export class GenOfficePptxFormatRuntime implements FormatRuntime {
       enrichment: new Map<string, unknown>([
         ["engine", "genoffice"],
         ["slideCount", opened.deck.slides.length],
-        ["deckSize", opened.deck.size]
+        ["deckSize", opened.deck.size],
+        [DECK_KEY, opened.deck]
       ])
     };
-    deckByContext.set(context, opened.deck);
     return context;
   }
 
@@ -96,7 +100,7 @@ export class GenOfficePptxFormatRuntime implements FormatRuntime {
   }
 
   static deckOf(context: ArtifactContext): PptxDeck | undefined {
-    return deckByContext.get(context);
+    return context.enrichment.get(DECK_KEY) as PptxDeck | undefined;
   }
 }
 
@@ -158,10 +162,10 @@ export class GenOfficeDocxFormatRuntime implements FormatRuntime {
       estimatedResidentBytes: estimateDocBytes(parsed, buffer.byteLength),
       enrichment: new Map<string, unknown>([
         ["engine", "genoffice"],
-        ["blockCount", parsed.blocks.length]
+        ["blockCount", parsed.blocks.length],
+        [DOC_KEY, parsed]
       ])
     };
-    docByContext.set(context, parsed);
     return context;
   }
 
@@ -185,7 +189,7 @@ export class GenOfficeDocxFormatRuntime implements FormatRuntime {
   }
 
   static docOf(context: ArtifactContext): ParsedDocx | undefined {
-    return docByContext.get(context);
+    return context.enrichment.get(DOC_KEY) as ParsedDocx | undefined;
   }
 }
 

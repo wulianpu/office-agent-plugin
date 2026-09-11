@@ -42,9 +42,9 @@ export interface CompatibilityLock {
 export const COMPATIBILITY_LOCK: CompatibilityLock = {
   plugin: "3.0.0",
   genoffice: "genspark-ai/genoffice@d35d770",
-  officecli: { version: "1.x", schemaFingerprint: "officecli-json-v1" },
+  officecli: { version: "1.x", schemaFingerprint: "probed-at-startup" },
   contract: 1,
-  dbSchema: 1
+  dbSchema: 2
 };
 
 export class OfficePlugin {
@@ -102,8 +102,8 @@ export class OfficePlugin {
     return this.service.beginEdit(sessionId, bookmark);
   }
 
-  humanSave(sessionId: string): Promise<{ revisionId: string; unchanged: boolean }> {
-    return this.service.humanSave(sessionId);
+  humanSave(sessionId: string, stagingRef?: ArtifactRef): Promise<{ revisionId: string; unchanged: boolean }> {
+    return this.service.humanSave(sessionId, stagingRef);
   }
 
   endEdit(sessionId: string): Promise<void> {
@@ -184,6 +184,15 @@ export class OfficePlugin {
 
   compatibilityLock(): CompatibilityLock {
     return COMPATIBILITY_LOCK;
+  }
+
+  /**
+   * Live compatibility snapshot: the officecli schema fingerprint is probed
+   * from the engine's help surface at startup (hash of the capability
+   * reference), not a hardcoded placeholder.
+   */
+  compatibilitySnapshot(): Promise<CompatibilityLock> {
+    return this.service.probeCompatibilitySnapshot();
   }
 
   async dispose(): Promise<void> {

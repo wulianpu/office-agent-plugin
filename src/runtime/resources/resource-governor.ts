@@ -64,6 +64,7 @@ export class ResourceGovernor implements IResourceGovernor {
   private nextLeaseId = 1;
   private readonly trimTargets: Array<ResourceTrimTarget & { active: boolean }> = [];
   private readonly listeners = new Set<(snapshot: ResourcePressureSnapshot) => void>();
+  private readonly releaseListeners = new Set<() => void>();
   private lastPressure: ResourcePressure = "normal";
   private trimming = false;
 
@@ -121,6 +122,11 @@ export class ResourceGovernor implements IResourceGovernor {
     };
   }
 
+  /** Fired on every release (scheduler re-pumps resource-blocked jobs). */
+  private notifyRelease(): void {
+    for (const listener of this.releaseListeners) listener();
+  }
+
   private releaseById(leaseId: string): void {
     const request = this.held.get(leaseId);
     if (!request) return;
@@ -138,6 +144,7 @@ export class ResourceGovernor implements IResourceGovernor {
     this.memoryUsed = Math.max(0, this.memoryUsed - bytes);
     if (request.protected) this.memoryProtected = Math.max(0, this.memoryProtected - bytes);
     this.refreshPressure();
+    this.notifyRelease();
   }
 
   getPressure(): ResourcePressureSnapshot {
@@ -155,6 +162,12 @@ export class ResourceGovernor implements IResourceGovernor {
   onPressureChange(listener: (snapshot: ResourcePressureSnapshot) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** P1-high-C: release notifications regardless of level transitions. */
+  onRelease(listener: () => void): () => void {
+    this.releaseListeners.add(listener);
+    return () => this.releaseListeners.delete(listener);
   }
 
   utilization(): Partial<Record<ResourceClass, number>> {
