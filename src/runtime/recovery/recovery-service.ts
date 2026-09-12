@@ -3,6 +3,15 @@
  * priority: filesystem hash facts > CommitJournal > session metadata. A
  * journal row in `committing` alone never guesses — the source file's actual
  * hash decides finalize vs rollback vs conflict (INV-15).
+ *
+ * P0 hardening (round 6):
+ *  - SOURCE_REPLACED forward-finalize uses the SAME atomic transaction as the
+ *    normal committer (prepare + finalizeCommitAtomically) — no crash window
+ *    between revision insert and journal flip.
+ *  - Source missing (hash undefined) is a CONFLICT that PRESERVES the temp
+ *    file — never deletes the only recoverable candidate copy.
+ *  - source-unregistrable keeps the journal UNRESOLVED (recovery-blocked),
+ *    never marks aborted when the physical commit already replaced the source.
  */
 
 import type { RecoveryOutcome } from "../../contracts/revision.js";
@@ -12,6 +21,7 @@ import type { RevisionLog } from "../revisions/revision-log.js";
 import type { DurableEventBus } from "../sessions/event-bus.js";
 import type { AtomicFileCommitter } from "../commit/atomic-file-committer.js";
 import type { ArtifactStore } from "../../artifact/store/artifact-store.js";
+import type { CommitJournalRecord } from "../../contracts/revision.js";
 
 export class RecoveryService {
   constructor(
@@ -43,9 +53,20 @@ export class RecoveryService {
   }): Promise<RecoveryOutcome> {
     const sourceHash = await sha256File(record.sourcePath).catch(() => undefined);
 
+    // ── P0-2: source missing is ALWAYS a conflict that preserves evidence ──
+    // The temp file may be the ONLY recoverable candidate copy. Never delete.
+    if (sourceHash === undefined) {
+      await this.emit(record.sessionId, {
+        commitId: record.commitId,
+        resolution: "conflict",
+        reason: "source-missing-preserve-temp"
+      });
+      return { commitId: record.commitId, resolution: "conflict", reason: "source-missing-preserve-temp" };
+    }
+
     if (record.phase === "prepared" || record.phase === "temp-ready") {
-      // Replace never happened (or never will): rollback if source untouched.
-      if (sourceHash === undefined || sourceHash === record.sourceHashBefore) {
+      // Replace never happened: source at base hash → safe rollback.
+      if (sourceHash === record.sourceHashBefore) {
         await this.committer.cleanupTemp(record as never);
         this.markPhase(record.commitId, "aborted");
         await this.emit(record.sessionId, {
@@ -70,34 +91,57 @@ export class RecoveryService {
     }
 
     if (record.phase === "source-replaced") {
-      // Replace happened; did finalize land? Decide purely by hash facts.
+      // Replace happened; hash facts decide.
       if (sourceHash === record.candidateHash) {
-        // Commit effectively completed; finalize the revision if missing.
-        const already = this.revisions
+        // ── P0-1: use the SAME atomic finalization as the normal committer.
+        // revision.prepare → finalizeCommitAtomically → journal FINALIZED in
+        // ONE transaction. No crash window between insert and phase flip.
+        let artifactRef: string;
+        try {
+          artifactRef = await this.resolveArtifactRef(record.sourcePath);
+        } catch {
+          // P1-high: the physical commit ALREADY replaced the source — this
+          // is recovery-blocked, NOT aborted. Keep the journal unresolved so
+          // the next recovery (or manual intervention) can finalize once the
+          // artifact becomes registrable.
+          await this.emit(record.sessionId, {
+            commitId: record.commitId,
+            resolution: "conflict",
+            reason: "source-unregistrable-recovery-blocked"
+          });
+          return {
+            commitId: record.commitId,
+            resolution: "conflict",
+            reason: "source-unregistrable-recovery-blocked"
+          };
+        }
+
+        const journalRecord = this.repos.getJournal(record.commitId);
+        if (!journalRecord) {
+          return { commitId: record.commitId, resolution: "conflict", reason: "journal-vanished" };
+        }
+
+        // Idempotency: if this exact commit already finalized (crash AFTER
+        // the transaction), the journal shows finalized and won't appear in
+        // unresolvedJournal. If we get here, the revision may or may not
+        // exist — the atomic transaction handles both (INSERT OR IGNORE
+        // semantics via the revision PK check below).
+        const existing = this.revisions
           .list(record.sessionId)
-          .some((r) => r.contentHash === record.candidateHash);
-        if (!already) {
-          let artifactRef: string;
-          try {
-            artifactRef = await this.resolveArtifactRef(record.sourcePath);
-          } catch {
-            // Source is gone / unregistrable — conflict, not a bad revision.
-            this.markPhase(record.commitId, "aborted");
-            await this.emit(record.sessionId, {
-              commitId: record.commitId,
-              resolution: "conflict",
-              reason: "source-unregistrable"
-            });
-            return { commitId: record.commitId, resolution: "conflict", reason: "source-unregistrable" };
-          }
-          this.revisions.commit({
+          .find((r) => r.contentHash === record.candidateHash && r.origin === record.origin);
+        if (!existing) {
+          const revision = this.revisions.prepare({
             sessionId: record.sessionId,
             artifactRef,
             contentHash: record.candidateHash,
             origin: record.origin as "human" | "agent" | "external"
           });
+          this.repos.finalizeCommitAtomically(revision, journalRecord);
+        } else {
+          // Revision exists but journal never flipped → flip it now.
+          this.markPhase(record.commitId, "finalized");
         }
-        this.markPhase(record.commitId, "finalized");
+
         await this.emit(record.sessionId, {
           commitId: record.commitId,
           resolution: "finalized",
@@ -106,7 +150,7 @@ export class RecoveryService {
         return { commitId: record.commitId, resolution: "finalized", contentHash: record.candidateHash };
       }
       if (sourceHash === record.sourceHashBefore) {
-        // Journal lied (replace recorded but bytes rolled back?) → rollback.
+        // Journal says replaced but source is at base → rollback.
         await this.committer.cleanupTemp(record as never);
         this.markPhase(record.commitId, "aborted");
         await this.emit(record.sessionId, {
@@ -133,17 +177,13 @@ export class RecoveryService {
   }
 
   /**
-   * P0 FAIL CLOSED: if the source cannot be registered (missing file, format
-   * not recognized), recovery reports a conflict — never fabricates an
-   * unresolvable ArtifactRef. The caller (recoverOne) turns the throw into
-   * a conflict outcome.
+   * P0 FAIL CLOSED: if the source cannot be registered, recovery reports
+   * recovery-blocked — never fabricates an unresolvable ArtifactRef.
    */
   private async resolveArtifactRef(sourcePath: string): Promise<string> {
     const existing = this.store.tryResolveRefByPath(sourcePath);
     if (existing) return existing;
     const format = sourcePath.split(".").pop() as "docx" | "xlsx" | "pptx";
-    // No catch: register throws on missing file / unknown format, and the
-    // revision must never carry a ref the store cannot resolve.
     return await this.store.register(sourcePath, { format });
   }
 

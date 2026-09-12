@@ -120,6 +120,11 @@ export class AtomicFileCommitter {
 
     await this.replaceAtomically(tempPath, request.sourcePath);
     await fsyncFile(request.sourcePath);
+    // P1 hardening: POSIX parent-dir fsync makes the rename durable across
+    // OS crash / sudden power loss (not just process crash). Windows
+    // doesn't support directory fsync — handled inside the helper.
+    const { fsyncParentDir } = await import("../../support/fsx.js");
+    await fsyncParentDir(request.sourcePath);
     await this.journal(record, "source-replaced");
 
     // Rehash the replaced source; must equal the candidate bytes.

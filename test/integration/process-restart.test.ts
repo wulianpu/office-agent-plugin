@@ -14,7 +14,6 @@ import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
 
 const run = promisify(execFile);
 const sha = (data: Buffer) => createHash("sha256").update(data).digest("hex");
@@ -175,9 +174,15 @@ async function runPhase(script: string, ...args: string[]): Promise<Record<strin
   }
 }
 
-describe.skipIf(!existsSync("C:/Program Files/Kingsoft/WPS Office") && process.platform === "win32")(
-  "process-restart recovery (§77)",
-  () => {
+/** CI without the OfficeCLI engine: the child processes need it for fixtures. */
+const engineAvailable = await import("../../src/agent/officecli/officecli-adapter.js")
+  .then(async (m) => {
+    const probe = new m.OfficeCliAdapter();
+    return probe.version_().then(() => true).catch(() => false);
+  })
+  .catch(() => false);
+
+describe.skipIf(!engineAvailable)("process-restart recovery (§77)", () => {
   it("committed state: restart resolves all refs and revisions intact", async () => {
     const dir = join(workspace, "committed");
     await mkdir(dir, { recursive: true });

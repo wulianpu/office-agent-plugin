@@ -55,11 +55,13 @@ export function fingerprintKey(fp: FileFingerprint): string {
  */
 export async function stableHashFile(
   path: string,
-  attempts = 3
+  options?: { attempts?: number; signal?: AbortSignal }
 ): Promise<{ hash: string; fingerprint: FileFingerprint } | null> {
+  const attempts = options?.attempts ?? 3;
   for (let attempt = 0; attempt < attempts; attempt++) {
+    if (options?.signal?.aborted) throw new DOMException("aborted", "AbortError");
     const before = await fileFingerprint(path);
-    const hash = await sha256File(path);
+    const hash = await sha256File(path, options?.signal);
     const after = await fileFingerprint(path);
     if (fingerprintKey(before) === fingerprintKey(after)) {
       return { hash, fingerprint: after };
@@ -92,13 +94,14 @@ export function canonicalSourceKey(path: string): string {
   return process.platform === "win32" ? real.toLowerCase() : real;
 }
 
-export async function sha256File(path: string): Promise<string> {
+export async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
   const hash = createHash("sha256");
   const handle = await open(path, "r");
   try {
     const buffer = Buffer.alloc(1024 * 1024);
     let position = 0n;
     for (;;) {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
       if (bytesRead === 0) break;
       hash.update(buffer.subarray(0, bytesRead));

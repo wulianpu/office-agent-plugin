@@ -41,6 +41,8 @@ export class SessionManager {
     promise: Promise<CommittedRevision>;
     cancel: () => void;
   }>();
+  /** P1: AbortControllers for in-flight background hashes (real cancellation). */
+  private readonly hashCancellers = new Map<SessionId, () => void>();
   /** P0-B: conflict watcher — installed by the service BEFORE open() so the
    *  background hash never races a missed filesystem event. */
   onSourceMutated?: (sourcePath: string, kind: "self-write" | "external") => void;
@@ -118,18 +120,19 @@ export class SessionManager {
     //  * a closed session never persists an orphan revision.
     const strong = (async () => {
       const sourcePath = this.store.resolvePath(artifactRef);
-      const stable = await this.scheduler
-        .submit({
-          label: `open-hash:${sessionId}`,
-          priority: "EDIT_PROMOTION",
-          resources: { io: 1 },
-          run: async () => {
-            const { stableHashFile } = await import("../../support/fsx.js");
-            // Single retry layer (stableHashFile already retries internally).
-            return stableHashFile(sourcePath);
-          }
-        })
-        .promise;
+      const cancelController = new AbortController();
+      const hashHandle = this.scheduler.submit({
+        label: `open-hash:${sessionId}`,
+        priority: "EDIT_PROMOTION",
+        resources: { io: 1 },
+        run: async () => {
+          const { stableHashFile } = await import("../../support/fsx.js");
+          return stableHashFile(sourcePath, { signal: cancelController.signal });
+        }
+      });
+      // Real cancellation: abort signal reaches sha256File's chunk loop.
+      this.hashCancellers.set(sessionId, () => cancelController.abort());
+      const stable = await hashHandle.promise;
       if (!stable) {
         // File keeps moving under us — surface as a conflict, not a bad hash.
         const live = this.sessions.get(sessionId);
@@ -168,13 +171,9 @@ export class SessionManager {
       }
       return revision;
     })();
-    const cancelSignal = new AbortController();
-    const cancellable = strong.then((revision) => {
-      if (cancelSignal.signal.aborted) throw new DOMException("cancelled", "AbortError");
-      return revision;
-    });
-    this.strongIdentity.set(sessionId, { promise: cancellable, cancel: () => cancelSignal.abort() });
-    cancellable.catch(() => undefined);
+    const cancelHash = () => this.hashCancellers.get(sessionId)?.();
+    this.strongIdentity.set(sessionId, { promise: strong, cancel: cancelHash });
+    strong.catch(() => undefined);
 
     await this.events.emit(sessionId, 1, "session.opened", {
       documentId,
@@ -278,6 +277,7 @@ export class SessionManager {
       .catch(() => undefined);
     this.strongIdentity.get(sessionId)?.cancel();
     this.strongIdentity.delete(sessionId);
+    this.hashCancellers.delete(sessionId);
   }
 
   list(): DocumentSession[] {

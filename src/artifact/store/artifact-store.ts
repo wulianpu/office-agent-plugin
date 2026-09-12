@@ -44,7 +44,7 @@ export class ArtifactStore {
     if (!this.persistence) return;
     for (const row of this.persistence.loadArtifacts()) {
       if (!this.byRef.has(row.ref)) {
-        await this.bindArtifact(row);
+        this.bindInMemory(row); // read-only: DB already has these rows
       }
     }
   }
@@ -112,13 +112,19 @@ export class ArtifactStore {
   }
 
   /**
-   * P1-high: SINGLE registration point — every source/staging binding goes
-   * through byRef + byPath (canonical) + persistence together.
+   * P1-high: SINGLE registration point — persistence FIRST (fail-fast), then
+   * memory maps. A persistence failure rolls back nothing because memory was
+   * not yet written.
    */
   private async bindArtifact(artifact: StoredArtifact): Promise<void> {
+    await this.persistence?.saveArtifact(artifact);
+    this.bindInMemory(artifact);
+  }
+
+  /** Memory-only binding — used by hydrate() which reads (not writes) the DB. */
+  private bindInMemory(artifact: StoredArtifact): void {
     this.byRef.set(artifact.ref, artifact);
     this.byPath.set(canonicalSourceKey(artifact.path), artifact.ref);
-    await this.persistence?.saveArtifact(artifact);
   }
 
   /** Register a staging file that already exists (e.g. produced by OfficeCLI create). */
@@ -175,7 +181,7 @@ export class ArtifactStore {
       await removeQuiet(join(this.stagingRoot, name));
       if (ref) {
         this.byRef.delete(ref);
-        this.byPath.delete(join(this.stagingRoot, name));
+        this.byPath.delete(canonicalSourceKey(join(this.stagingRoot, name)));
         await this.persistence?.deleteArtifact(ref);
       }
       removed++;
