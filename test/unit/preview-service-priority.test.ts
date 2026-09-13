@@ -341,6 +341,68 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     await new Promise((resolve) => setImmediate(resolve));
   });
 
+  it("a joiner with a PRE-ABORTED signal detaches symmetrically — no ghost consumer (round 10 reopen #3)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    const runtime = {
+      format: "xlsx" as const,
+      builds: [] as string[],
+      gates: [] as Array<() => void>,
+      async createArtifactContext(input: { artifactRef: string; consistency: "optimistic" | "stable" }) {
+        runtime.builds.push(input.artifactRef);
+        await new Promise<void>((resolve) => runtime.gates.push(resolve));
+        return {
+          artifactRef: input.artifactRef,
+          version: { artifactRef: input.artifactRef, fingerprint: { size: 1n, mtimeNs: 1n } },
+          format: "xlsx" as const,
+          consistency: input.consistency,
+          rendererVersion: "test",
+          lastAccessAt: Date.now(),
+          enrichment: new Map()
+        };
+      },
+      initialize: async () => undefined,
+      trimMemory: async () => undefined,
+      dispose: async () => undefined
+    };
+    registry.registerRuntime(runtime, "full");
+    registry.setBuildScheduler(scheduler);
+    const path = join(dir, "ghost-guard.xlsx");
+    await writeFile(path, Buffer.alloc(24, 11));
+    registry.setPathResolver(() => path);
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => [{ name: "Sheet1", window: [["x"]], rowCount: 1 }]
+      }
+    );
+
+    // A establishes the shared render with a gated full build.
+    const controllerA = new AbortController();
+    const a = service.preview({ requestId: "ghost-a", artifactRef: "art-ghost", priority: "background", visual: true, signal: controllerA.signal });
+    void a.catch(() => undefined);
+    await waitFor(() => runtime.builds.length === 1 && scheduler.runningCount === 1);
+
+    // B joins with a signal aborted BEFORE the call: immediate AbortError AND
+    // symmetric detach (no stranded consumer in the shared entry).
+    const controllerB = new AbortController();
+    controllerB.abort();
+    await expect(
+      service.preview({ requestId: "ghost-b", artifactRef: "art-ghost", priority: "background", visual: true, signal: controllerB.signal })
+    ).rejects.toMatchObject({ name: "AbortError" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // A is now the ONLY live consumer — its abort must cancel the lifecycle
+    // (a ghost B would keep the shared entry alive forever).
+    controllerA.abort();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(0); // queued shared build dequeued via lifecycle abort
+    await a.catch(() => undefined);
+  });
+
   it("consumer-aware cancellation: one joiner aborting never kills the other's shared work (round 10 reopen)", async () => {
     const scheduler = new Scheduler({ maxConcurrent: 1 });
     const registry = new ArtifactRegistry();

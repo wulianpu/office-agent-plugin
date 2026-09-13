@@ -295,13 +295,30 @@ export class PreviewService {
       ? Promise.race([shared.promise, personal])
       : shared.promise;
 
+    // Round 10 reopen: a PRE-ABORTED signal detaches synchronously BEFORE
+    // any await — the joiner's registry.acquire() would reject outside the
+    // try/finally and strand this consumer in shared.consumers forever
+    // (ghost consumer: the real last consumer could then never cancel the
+    // shared lifecycle).
+    if (request.signal?.aborted) {
+      onAbort?.();
+      // The race promise rejects with no awaiter in this early-exit path —
+      // silence it explicitly (the caller gets the throw below).
+      void awaited.catch(() => undefined);
+      throw new DOMException("consumer aborted", "AbortError");
+    }
+
     // Joiners acquire the registry context themselves: the acquire JOINS the
     // same build (no duplicate parse) and promotes a still-queued build to
     // this consumer's priority — inheritance works even while the shared
     // render is still inside its own registry.acquire (no handles yet).
-    const ownLease = first
-      ? undefined
-      : await this.registry.acquire({
+    // The acquire sits INSIDE the lifecycle try/finally: every path after
+    // consumers.add() (build rejection, joiner acquire rejection, settle)
+    // detaches symmetrically.
+    let ownLease: ArtifactLease | undefined;
+    try {
+      if (!first) {
+        ownLease = await this.registry.acquire({
           artifactRef: request.artifactRef,
           format,
           consistency: "optimistic",
@@ -310,8 +327,7 @@ export class PreviewService {
           consumer: consumerId,
           signal: request.signal
         });
-    try {
-      if (request.signal?.aborted && onAbort) onAbort(); // pre-aborted
+      }
       return await awaited;
     } finally {
       ownLease?.release();

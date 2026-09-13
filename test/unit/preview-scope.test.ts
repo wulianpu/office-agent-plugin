@@ -113,6 +113,13 @@ describe("PreviewScope (round 10, issue #4)", () => {
     expect(capped.sheets[0]!.window).toHaveLength(1); // maxEntries actually bounds output
   });
 
+  it("xlsx fallback: an explicit MISSING sheet fails closed — empty scoped result, never other sheets (round 10 reopen #3)", async () => {
+    const path = await writeTwoSheetWorkbook("missing-sheet");
+    const outline = await renderXlsxOutline(path, { location: { sheet: "DoesNotExist" } });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets).toEqual([]); // fail-closed: no Alpha/Data masquerading
+  });
+
   it("pptx: slide scope windows at the requested slide", async () => {
     const path = await writeSlideDeck(25);
     const scoped = await renderPptxOutline(path, { location: { slide: 20 }, maxEntries: 2 });

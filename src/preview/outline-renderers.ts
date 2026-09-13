@@ -128,8 +128,17 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   // never extend the window past toRow.
   const toRow = range ? Math.max(fromRow, range.toRow) : Number.POSITIVE_INFINITY;
 
+  // Round 10 reopen (fail-closed): an EXPLICIT sheet that does not exist
+  // yields an EMPTY scoped result — never the workbook's real sheets under
+  // a cache key naming the missing sheet.
+  if (wantedSheet && !sheetTags.some((t) => t.name === wantedSheet)) {
+    return { kind: "xlsx", sheets: [] };
+  }
   const ordered = wantedSheet
-    ? [...(sheetTags.find((t) => t.name === wantedSheet) ? [sheetTags.find((t) => t.name === wantedSheet)!] : []), ...sheetTags.filter((t) => t.name !== wantedSheet)]
+    ? [
+        sheetTags.find((t) => t.name === wantedSheet)!,
+        ...sheetTags.filter((t) => t.name !== wantedSheet)
+      ]
     : sheetTags;
 
   let sheetIdx = 0;

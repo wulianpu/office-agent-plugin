@@ -63,6 +63,75 @@ function makeClient(options?: { requestTimeoutMs?: number; unhealthyCooldownMs?:
   return { client, child };
 }
 
+describe("sidecarPreviewWindow scope boundaries (round 10 reopen #3)", () => {
+  function fakeClient(sheets: Array<{ id: string; name: string; rowCount?: number; columnCount?: number }>, reads: Array<Record<string, number>> = [], cells: Array<{ row: number; column: number; value: string }> = []) {
+    return {
+      open: async () => ({ sessionId: "s", sheets }),
+      readRange: async (_s: string, _id: string, range: Record<string, number>) => {
+        reads.push(range);
+        return { cells };
+      },
+      close: async () => undefined
+    } as unknown as XlsxSidecarClient;
+  }
+
+  it("an explicit MISSING sheet fails closed: empty result, no reads, no other sheets", async () => {
+    const reads: Array<Record<string, number>> = [];
+    const fake = fakeClient([{ id: "1", name: "Data", rowCount: 20 }], reads);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", { sheet: "DoesNotExist", range: { fromRow: 1, toRow: 3, fromCol: 1, toCol: 3 } });
+    expect(out).toEqual([]); // never the real "Data" sheet under a missing-sheet key
+    expect(reads).toHaveLength(0);
+  });
+
+  it("near-edge ranges clamp to the REMAINING extent, not the full sheet", async () => {
+    // 20-row sheet. A18:C30 asks for 13 rows; only 3 remain from row 18.
+    const reads: Array<Record<string, number>> = [];
+    const fake = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads, [
+      { row: 17, column: 0, value: "A18" },
+      { row: 18, column: 0, value: "A19" },
+      { row: 19, column: 0, value: "A20" }
+    ]);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", {
+      range: { fromRow: 18, toRow: 30, fromCol: 1, toCol: 3 },
+      maxRows: 13,
+      maxCols: 3
+    });
+    // endRow clamped to the sheet edge (19), not startRow0 + 13 - 1 (29).
+    expect(reads[0]).toEqual({ startRow: 17, endRow: 19, startColumn: 0, endColumn: 2 });
+    expect(out[0]!.window).toHaveLength(3); // the legal remainder, never a fixed 5-row retry
+    expect(out[0]!.window[0]![0]).toBe("A18");
+  });
+
+  it("a full in-extent range reads everything it asked for (A10:C20 of 20 rows -> 11 rows)", async () => {
+    const reads: Array<Record<string, number>> = [];
+    const cells = Array.from({ length: 11 }, (_, i) => ({ row: 9 + i, column: 0, value: "A" + (10 + i) }));
+    const fake = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads, cells);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", {
+      range: { fromRow: 10, toRow: 20, fromCol: 1, toCol: 3 },
+      maxRows: 11,
+      maxCols: 3
+    });
+    expect(reads[0]).toEqual({ startRow: 9, endRow: 19, startColumn: 0, endColumn: 2 });
+    expect(out[0]!.window).toHaveLength(11);
+  });
+
+  it("an origin beyond the declared extent yields an explicitly empty window without reads", async () => {
+    const reads: Array<Record<string, number>> = [];
+    const fake = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", {
+      range: { fromRow: 25, toRow: 30, fromCol: 1, toCol: 3 }
+    });
+    expect(out[0]!.window).toEqual([]);
+    expect(reads).toHaveLength(0);
+    const fakeCol = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads);
+    const outCol = await sidecarPreviewWindow(fakeCol, "book.xlsx", {
+      range: { fromRow: 1, toRow: 5, fromCol: 7, toCol: 9 }
+    });
+    expect(outCol[0]!.window).toEqual([]);
+    expect(reads).toHaveLength(0);
+  });
+});
+
 describe("sidecarPreviewWindow range origin (round 10 reopen)", () => {
   it("forwards the 1-based range as native 0-based read coordinates AND rebases absolute responses (round 10 reopen)", async () => {
     const ranges: Array<Record<string, number>> = [];

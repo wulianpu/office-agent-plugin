@@ -266,29 +266,50 @@ export async function sidecarPreviewWindow(
   const startCol0 = options.range ? Math.max(0, Math.floor(options.range.fromCol) - 1) : 0;
   const opened = await client.open(path);
   const out: Array<{ name: string; window: string[][]; rowCount?: number }> = [];
+  // Round 10 reopen (fail-closed): an EXPLICIT sheet that does not exist
+  // yields an EMPTY scoped window — never the workbook's other sheets
+  // masquerading under a cache key that names the missing sheet.
+  if (options.sheet && !opened.sheets.some((s) => s.name === options.sheet)) {
+    await client.close(opened.sessionId).catch(() => undefined);
+    return out;
+  }
   const sheets = options.sheet
     ? [
-        ...(opened.sheets.find((s) => s.name === options.sheet)
-          ? [opened.sheets.find((s) => s.name === options.sheet)!]
-          : []),
+        opened.sheets.find((s) => s.name === options.sheet)!,
         ...opened.sheets.filter((s) => s.name !== options.sheet)
       ]
     : opened.sheets;
   try {
     for (const sheet of sheets.slice(0, options.maxSheets ?? 4)) {
-      // Clamp the WINDOW SIZE to the sheet's declared extent (fall back to a
-      // probe window when metadata omits dimensions — read_range rejects
-      // out-of-sheet reads); the origin offsets stay as requested.
-      const rows = Math.max(1, Math.min(maxRows, sheet.rowCount ?? maxRows));
-      const cols = Math.max(1, Math.min(maxCols, sheet.columnCount ?? maxCols));
-      let result = await client
-        .readRange(opened.sessionId, sheet.id, {
+      // Round 10 reopen: clamp against the REMAINING extent from the window
+      // origin (declared extent minus start), not the full-sheet extent — a
+      // near-edge range must return exactly the legal remainder (A18:C30 on
+      // a 20-row sheet → 3 rows), never a fixed retry window.
+      const remainingRows =
+        sheet.rowCount !== undefined ? Math.max(0, sheet.rowCount - startRow0) : undefined;
+      const remainingCols =
+        sheet.columnCount !== undefined ? Math.max(0, sheet.columnCount - startCol0) : undefined;
+      // Origin beyond the declared extent: an explicitly empty scoped window,
+      // no speculative reads.
+      if (remainingRows === 0 || remainingCols === 0) {
+        out.push({ name: sheet.name, window: [], rowCount: sheet.rowCount });
+        continue;
+      }
+      const rows = Math.max(1, Math.min(maxRows, remainingRows ?? maxRows));
+      const cols = Math.max(1, Math.min(maxCols, remainingCols ?? maxCols));
+      const read = () =>
+        client.readRange(opened.sessionId, sheet.id, {
           startRow: startRow0,
           endRow: startRow0 + rows - 1,
           startColumn: startCol0,
           endColumn: startCol0 + cols - 1
-        })
-        .catch(async () =>
+        });
+      // The 5×5 probe retries ONLY when metadata omitted the extent — never
+      // to mask a boundary error on a KNOWN extent (that rejection must
+      // propagate so the caller falls back honestly).
+      let result;
+      if (remainingRows === undefined || remainingCols === undefined) {
+        result = await read().catch(async () =>
           client.readRange(opened.sessionId, sheet.id, {
             startRow: startRow0,
             endRow: startRow0 + 4,
@@ -296,7 +317,9 @@ export async function sidecarPreviewWindow(
             endColumn: startCol0 + 4
           })
         );
-      result = await result;
+      } else {
+        result = await read();
+      }
       out.push({
         name: sheet.name,
         window: normalizeWindow(result, maxRows, maxCols, startRow0, startCol0),
