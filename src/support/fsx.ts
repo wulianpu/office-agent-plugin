@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   copyFile,
   mkdir,
@@ -12,6 +13,22 @@ import {
 } from "node:fs/promises";
 import type { FileFingerprint } from "../contracts/artifact.js";
 import { OfficeRuntimeError } from "../contracts/document.js";
+
+/**
+ * Canonical long-form path (dir via realpath + basename). Windows 8.3 short
+ * paths (e.g. RUNNER~1 from %TEMP%) crash libuv's fs-event watcher (libuv
+ * #5010 / node #63638) when ANY process watches them, and short/long aliases
+ * of one file break path-keyed identities. Everything that reaches a
+ * watcher, a child-process env or an engine invocation is normalized here.
+ */
+export function longFormPath(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return join(realpathSync(dirname(absolute)), basename(absolute));
+  } catch {
+    return absolute;
+  }
+}
 
 export async function pathExists(path: string): Promise<boolean> {
   try {

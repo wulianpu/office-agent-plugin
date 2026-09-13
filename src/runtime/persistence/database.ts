@@ -38,12 +38,19 @@ export class RuntimeDatabase {
         `session DB schema ${current} is newer than runtime supports (${DB_SCHEMA_VERSION})`
       );
     }
+    // Crash-atomic per version (round 8, P1-high): each migration's DDL and
+    // the schemaVersion bump share ONE transaction. A crash mid-migration
+    // rolls the DDL back, so a restart retries exactly this version — never
+    // a half-applied schema with a stale meta. The old code flipped meta only
+    // after ALL versions, leaving a duplicate-column brick window.
     for (let v = current + 1; v <= DB_SCHEMA_VERSION; v++) {
-      this.applyMigration(v);
+      this.withTransaction(() => {
+        this.applyMigration(v);
+        this.db
+          .prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schemaVersion', ?)")
+          .run(String(v));
+      });
     }
-    this.db
-      .prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schemaVersion', ?)")
-      .run(String(DB_SCHEMA_VERSION));
   }
 
   private applyMigration(version: number): void {
@@ -164,10 +171,23 @@ export class RuntimeDatabase {
       // the journal row that produced them. UNIQUE (NULLs allowed for legacy
       // rows and journal-less external revisions) — recovery decides "has
       // this commit landed?" by exact identity, never by content hash.
-      this.db.exec(`
-        ALTER TABLE revisions ADD COLUMN commit_id TEXT;
-        CREATE UNIQUE INDEX idx_revisions_commit_id ON revisions(commit_id);
-      `);
+      // Tolerant to a legacy partial state (column added by a pre-atomic
+      // migration that crashed before flipping meta): re-running must
+      // complete, never brick on duplicate column/index.
+      const columns = this.db.prepare("PRAGMA table_info(revisions)").all() as Array<{
+        name: string;
+      }>;
+      if (!columns.some((c) => c.name === "commit_id")) {
+        this.db.exec(`ALTER TABLE revisions ADD COLUMN commit_id TEXT;`);
+      }
+      const index = this.db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_revisions_commit_id'"
+        )
+        .get();
+      if (!index) {
+        this.db.exec(`CREATE UNIQUE INDEX idx_revisions_commit_id ON revisions(commit_id);`);
+      }
     }
   }
 

@@ -15,6 +15,7 @@ import type { VerificationReport } from "../contracts/verification.js";
 import type { EditorInstance, OfficeEditorPlugin } from "../contracts/editor.js";
 import type { WriterLease } from "../contracts/lease.js";
 import { OfficeRuntimeService } from "../runtime/service/office-runtime-service.js";
+import { DB_SCHEMA_VERSION } from "../runtime/persistence/database.js";
 import { OfficeMcpTools } from "../mcp/tools.js";
 import { McpStdioServer } from "../mcp/server.js";
 import { PortableReviewView } from "../mcp/portable-review/portable-review-view.js";
@@ -44,7 +45,10 @@ export const COMPATIBILITY_LOCK: CompatibilityLock = {
   genoffice: "genspark-ai/genoffice@d35d770",
   officecli: { version: "1.x", schemaFingerprint: "probed-at-startup" },
   contract: 1,
-  dbSchema: 2
+  // Single source of truth: the persistence layer's schema constant. A drift
+  // here lied about v2 while the DB was already v3 (round 8, P1-high) — the
+  // invariant test now fails the suite on any future divergence.
+  dbSchema: DB_SCHEMA_VERSION
 };
 
 export class OfficePlugin {

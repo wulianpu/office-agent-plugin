@@ -137,20 +137,26 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
 function parseRowCells(rowXml: string, shared: string[]): string[] {
   const cells: string[] = [];
   // Namespace-tolerant cell matchers: engine sheets use <x:c>/<x:v>/<x:is>.
-  const cellRe = /<(?:[\w.-]+:)?c ([^>]*)>[\s\S]*?<\/(?:[\w.-]+:)?c>|<(?:[\w.-]+:)?c ([^>]*)\/>/g;
+  // The open-tag alternative requires a non-`/` before `>` so a self-closed
+  // cell can never swallow the NEXT cell's content up to its close tag —
+  // that misparse chained the follower's value into blank cells (round 8).
+  const cellRe =
+    /<(?:[\w.-]+:)?c ([^>]*[^/>])>[\s\S]*?<\/(?:[\w.-]+:)?c>|<(?:[\w.-]+:)?c ([^>]*?)\/>/g;
   for (const m of rowXml.matchAll(cellRe)) {
+    const cellXml = m[0];
     const attrs = (m[1] ?? m[2] ?? "") + ">";
     const refMatch = attrs.match(/r="([A-Z]+)\d+"/);
     const ref = refMatch?.[1] ?? "";
+    // Value extraction is scoped to THIS cell's XML only — slicing from
+    // m.index across the row let an empty cell inherit the next cell's <v>.
     let value = "";
-    const rest = rowXml.slice(m.index ?? 0);
-    const vMatch = rest.match(/<(?:[\w.-]+:)?v>([^<]*)<\/(?:[\w.-]+:)?v>/);
+    const vMatch = cellXml.match(/<(?:[\w.-]+:)?v>([^<]*)<\/(?:[\w.-]+:)?v>/);
     if (vMatch) {
       const raw = vMatch[1]!;
       const isShared = /t="s"/.test(attrs);
       value = isShared ? (shared[Number(raw)] ?? "") : raw;
     } else {
-      const inline = rest.match(/<(?:[\w.-]+:)?is>\s*<(?:[\w.-]+:)?t[^>]*>([^<]*)<\/(?:[\w.-]+:)?t>/);
+      const inline = cellXml.match(/<(?:[\w.-]+:)?is>\s*<(?:[\w.-]+:)?t[^>]*>([^<]*)<\/(?:[\w.-]+:)?t>/);
       if (inline) value = inline[1]!;
     }
     const colIndex = ref ? columnToIndex(ref) : cells.length;

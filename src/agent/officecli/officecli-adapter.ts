@@ -12,8 +12,10 @@
  */
 
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { access, constants, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { longFormPath } from "../../support/fsx.js";
 
 export interface OfficeCliJson {
   success: boolean;
@@ -50,7 +52,7 @@ export class OfficeCliAdapter {
    * for one-shot tasks (§63). No resident involved.
    */
   async runBatchStandalone(file: string, items: unknown[]): Promise<{ results: Array<{ index: number; success: boolean; output: string }>; summary: Record<string, number> }> {
-    const json = await this.exec(["batch", file, "--json"], {
+    const json = await this.exec(["batch", this.canonFile(file), "--json"], {
       stdin: JSON.stringify(items)
     });
     const data = json.data as { results?: unknown; summary?: Record<string, number> } | undefined;
@@ -73,33 +75,33 @@ export class OfficeCliAdapter {
   }
 
   async open(file: string): Promise<void> {
-    await this.exec(["open", file, "--json"]);
+    await this.exec(["open", this.canonFile(file), "--json"]);
   }
 
   /** Read visibility barrier (§64, INV-06): flush in-memory mutation to disk, keep resident. */
   async save(file: string): Promise<void> {
-    await this.exec(["save", file, "--json"]);
+    await this.exec(["save", this.canonFile(file), "--json"]);
   }
 
   /** Writer handoff barrier (§64, INV-07): flush + release the resident. */
   async close(file: string): Promise<void> {
-    await this.exec(["close", file, "--json"]);
+    await this.exec(["close", this.canonFile(file), "--json"]);
   }
 
   async get(file: string, path: string): Promise<OfficeCliJson["data"]> {
-    const json = await this.exec(["get", file, path, "--json"]);
+    const json = await this.exec(["get", this.canonFile(file), path, "--json"]);
     await this.releaseAutoResident(file);
     return json.data;
   }
 
   async query(file: string, selector: string): Promise<OfficeCliJson["data"]> {
-    const json = await this.exec(["query", file, selector, "--json"]);
+    const json = await this.exec(["query", this.canonFile(file), selector, "--json"]);
     await this.releaseAutoResident(file);
     return json.data;
   }
 
   async validate(file: string): Promise<{ passed: boolean; message: string }> {
-    const json = await this.exec(["validate", file, "--json"]);
+    const json = await this.exec(["validate", this.canonFile(file), "--json"]);
     await this.releaseAutoResident(file);
     const message = typeof json.data === "string" ? json.data : (json.message ?? "");
     // officecli signals validation failure with success:false + nonzero exit;
@@ -108,12 +110,21 @@ export class OfficeCliAdapter {
   }
 
   /**
+   * Canonical long-form file identity on Windows (round 8): a path passed as
+   * an 8.3 short alias and the same path in long form must reach the engine
+   * as ONE identity — otherwise the engine keys two residents for one file.
+   */
+  private canonFile(file: string): string {
+    return process.platform === "win32" ? longFormPath(file) : file;
+  }
+
+  /**
    * officecli read commands may asynchronously start a resident daemon that
    * holds a Windows file lock. A no-op close releases it; pool-owned
    * residents simply get reopened by the next mutation round.
    */
   private async releaseAutoResident(file: string): Promise<void> {
-    await this.exec(["close", file, "--json"]).catch(() => undefined);
+    await this.exec(["close", this.canonFile(file), "--json"]).catch(() => undefined);
   }
 
   async version_(): Promise<string> {
@@ -183,13 +194,32 @@ export class OfficeCliAdapter {
 
   private childEnv(): NodeJS.ProcessEnv {
     // Offline gate (§120): no self-update, no telemetry, explicit flush policy.
-    return {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       OFFICECLI_NO_UPDATE: "1",
       OFFICECLI_NO_UPDATE_NOTIFIER: "1",
       OFFICECLI_RESIDENT_FLUSH: "off",
       NO_COLOR: "1"
     };
+    // Round 8: the engine's own Node process fs.watch()es files under TEMP —
+    // an inherited 8.3 short TEMP/TMP aborts it with libuv's fs-event C
+    // assertion (libuv#5010/node#63638). Normalize to the long form so the
+    // protection lives in the runtime, not only in CI workflow settings.
+    if (process.platform === "win32") {
+      for (const key of ["TEMP", "TMP"] as const) {
+        const value = env[key];
+        if (typeof value === "string" && value) {
+          // The env value is a DIRECTORY — realpath the whole path so a short
+          // alias in ANY component (including the last) is expanded.
+          try {
+            env[key] = realpathSync(value);
+          } catch {
+            // Nonexistent dir: leave as-is; the engine surfaces its own error.
+          }
+        }
+      }
+    }
+    return env;
   }
 
   private parseJson(stdout: string): OfficeCliJson | undefined {

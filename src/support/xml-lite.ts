@@ -147,8 +147,18 @@ export function splitRows(chunk: string, carry: { pending: string }): string[] {
     rows.push(data.slice(open.index, close.index + close[0].length));
     lastScan = close.index + close[0].length;
   }
-  if (!carry.pending && lastScan === 0) {
-    carry.pending = data.slice(Math.max(0, data.length - 8));
+  // Partial-tag carry (round 8): a chunk may end mid open-tag (`<x:r` of
+  // `<x:row`) even after complete rows were extracted. The old `lastScan===0`
+  // guard dropped that tail — a chunk-boundary-dependent silent row loss.
+  // Carry from the last `<` only when no `>` follows it in the unconsumed
+  // remainder (i.e. it is provably a partial tag); a complete tag in the
+  // tail carries nothing, so extracted rows are never re-emitted.
+  if (!carry.pending) {
+    const unconsumed = data.slice(lastScan);
+    const lastLt = unconsumed.lastIndexOf("<");
+    if (lastLt >= 0 && !unconsumed.slice(lastLt).includes(">")) {
+      carry.pending = unconsumed.slice(lastLt);
+    }
   }
   return rows;
 }

@@ -50,8 +50,9 @@ export class SelfWriteGuardRegistry {
  * filesystem hashes).
  */
 
-import { realpathSync, watch, type FSWatcher } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { watch, type FSWatcher } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { longFormPath } from "../../support/fsx.js";
 
 export interface SourceMutationEvent {
   sourcePath: string;
@@ -59,21 +60,12 @@ export interface SourceMutationEvent {
 }
 
 /**
- * Canonical long-form path (dir via realpath + basename). Windows 8.3 short
- * paths (e.g. RUNNER~1 from %TEMP%) crash libuv's fs-event watcher: the OS
- * reports long-name files whose prefix no longer matches the short watched
- * directory — a C-level assertion that ABORTS the process. Every path that
- * reaches watch()/watcher callbacks is normalized through here so both sides
- * always compare in the same form.
+ * Canonical long-form path — shared helper, see support/fsx.ts. Every path
+ * that reaches watch()/watcher callbacks is normalized through it so both
+ * sides always compare in the same form (Windows 8.3 short paths otherwise
+ * crash libuv's fs-event watcher with a process-aborting C assertion).
  */
-export function longFormPath(path: string): string {
-  const absolute = resolve(path);
-  try {
-    return join(realpathSync(dirname(absolute)), basename(absolute));
-  } catch {
-    return absolute;
-  }
-}
+export { longFormPath };
 
 export class SourceWatcher {
   /**

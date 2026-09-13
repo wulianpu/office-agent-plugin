@@ -169,3 +169,70 @@ describe.skipIf(!engineUp)("Agent write path (§158)", () => {
     await ws.plugin.closeSession(session.sessionId);
   });
 });
+
+describe.skipIf(!engineUp || process.platform !== "win32")(
+  "Windows 8.3 short-path hardening (round 8)",
+  () => {
+    it("short-alias TEMP and file paths through the adapter: no abort, one identity", async (ctx) => {
+      // Acceptance (issue #2): the parent process TEMP/TMP set to an 8.3
+      // alias must not abort the engine (libuv fs-event assertion), and a
+      // file referenced once by short alias and once by long path must stay
+      // ONE engine identity (no double resident / double writer).
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const { mkdtemp, rm } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const run = promisify(execFile);
+
+      // Create a directory whose name forces an 8.3 alias (>8 chars) and ask
+      // Windows for its short form. Volumes with 8.3 disabled return the
+      // long form — the scenario is untestable there, skip honestly.
+      const longDir = await mkdtemp(join(tmpdir(), "shortpathprobe-longname-"));
+      let shortDir: string;
+      try {
+        shortDir = (
+          await run("powershell", [
+            "-NoProfile",
+            "-Command",
+            `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${longDir.replace(/\\/g, "\\\\")}').ShortPath`
+          ])
+        ).stdout.trim();
+      } catch {
+        shortDir = longDir;
+      }
+      if (shortDir === longDir) {
+        await rm(longDir, { recursive: true, force: true }).catch(() => undefined);
+        ctx.skip(); // no 8.3 aliases on this volume
+      }
+
+      const { OfficeCliAdapter } = await import("../../src/agent/officecli/officecli-adapter.js");
+      const previousTemp = process.env.TEMP;
+      const previousTmp = process.env.TMP;
+      process.env.TEMP = shortDir;
+      process.env.TMP = shortDir;
+      try {
+        const adapter = new OfficeCliAdapter({ timeoutMs: 60_000 });
+        const longPath = join(longDir, "probe.docx");
+        const shortPath = join(shortDir, "probe.docx");
+
+        // Create via the LONG path, then operate through the SHORT alias —
+        // the adapter must canonicalize both to one engine identity.
+        await adapter.run(["create", longPath, "--json"]).catch(() => undefined);
+        await adapter.runBatchStandalone(shortPath, [
+          { command: "add", parent: "/body", type: "paragraph", props: { text: "short path probe" } }
+        ]);
+        await adapter.save(shortPath);
+        await adapter.close(longPath); // long alias must release the SAME resident
+
+        const check = await adapter.get(shortPath, "/body/paragraph[1]");
+        expect(JSON.stringify(check)).toContain("short path probe");
+        await adapter.close(shortPath).catch(() => undefined);
+      } finally {
+        process.env.TEMP = previousTemp;
+        process.env.TMP = previousTmp;
+        await rm(longDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }, 120_000);
+  }
+);
