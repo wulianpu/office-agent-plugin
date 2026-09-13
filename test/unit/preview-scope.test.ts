@@ -151,6 +151,45 @@ describe("PreviewScope (round 10, issue #4)", () => {
     expect(outline.sheets[0]!.window).toHaveLength(11);
   });
 
+  it("xlsx fallback: a range starting beyond column 256 resolves (IW10:IY20) — no absolute column ceiling (round 10 reopen)", async () => {
+    // IW/IY are 1-based columns 257..259 — the old colParseCap(256) and the
+    // pad-from-A approach both failed here. Direct absolute->local placement
+    // keeps the working set proportional to the WINDOW.
+    const colName = (n: number): string => {
+      let name = "";
+      while (n > 0) {
+        const rem = (n - 1) % 26;
+        name = String.fromCharCode(65 + rem) + name;
+        n = Math.floor((n - 1) / 26);
+      }
+      return name;
+    };
+    const mk = (r: number) =>
+      [256, 257, 258, 259, 260]
+        .map((c) => `<c r="${colName(c)}${r}"><v>${colName(c)}${r}</v></c>`)
+        .join("");
+    const rows = Array.from({ length: 20 }, (_, i) => `<row r="${i + 1}">${mk(i + 1)}</row>`).join("");
+    const path = await writeRawSheetWorkbook("beyond-256", rows);
+    const outline = await renderXlsxOutline(path, {
+      location: { range: { fromRow: 10, toRow: 20, fromCol: 257, toCol: 259 } }
+    });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets[0]!.window[0]).toEqual(["IW10", "IX10", "IY10"]);
+    expect(outline.sheets[0]!.window[10]).toEqual(["IW20", "IX20", "IY20"]);
+  });
+
+  it("pptx out-of-range scope clamps to the last slide in BOTH outline and SVG window (round 10 reopen)", async () => {
+    // Engine-path policy: svgWindowOf clamps `from` to the last slide; the
+    // outline now derives from the same function.
+    expect(svgWindowOf(25, { location: { slide: 90 } }, 6)).toEqual({ from: 24, count: 1 });
+    // Zip fallback policy: same clamp — never an empty outline.
+    const path = await writeSlideDeck(25);
+    const scoped = await renderPptxOutline(path, { location: { slide: 90 } });
+    if (scoped.kind !== "pptx") throw new Error("expected pptx outline");
+    expect(scoped.slides).toHaveLength(1);
+    expect(scoped.slides[0]!.index).toBe(25); // the LAST slide, not empty
+  });
+
   it("xlsx fallback: maxEntries narrows an explicit range but never extends past toRow", async () => {
     const rows = Array.from({ length: 30 }, (_, i) => `<row r="${i + 1}"><c r="A${i + 1}"><v>${i + 1}</v></c></row>`).join("");
     const path = await writeRawSheetWorkbook("torow-bound", rows);

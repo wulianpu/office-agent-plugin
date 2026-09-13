@@ -127,10 +127,6 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   // An explicit range is a HARD row boundary: maxEntries may narrow it but
   // never extend the window past toRow.
   const toRow = range ? Math.max(fromRow, range.toRow) : Number.POSITIVE_INFINITY;
-  // A scoped range may start beyond the default 24-column parse cap (e.g.
-  // AA10:AC20) — parse wide enough to cover the requested window, still
-  // bounded by an absolute ceiling.
-  const colParseCap = range ? Math.min(256, fromCol - 1 + maxCols) : XLSX_MAX_COLS;
 
   const ordered = wantedSheet
     ? [...(sheetTags.find((t) => t.name === wantedSheet) ? [sheetTags.find((t) => t.name === wantedSheet)!] : []), ...sheetTags.filter((t) => t.name !== wantedSheet)]
@@ -171,7 +167,7 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
             break;
           }
           if (absolute >= fromRow && window.length < maxRows) {
-            window.push(windowRow(parseRowCells(row, shared, colParseCap), fromCol, maxCols));
+            window.push(parseRowCells(row, shared, fromCol, maxCols));
           }
           if (rowCount > 500_000) break; // row-count probe cap
         }
@@ -187,20 +183,18 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   return { kind: "xlsx", sheets };
 }
 
-/** Slice a parsed row into the scoped column window (1-based, inclusive). */
-function windowRow(cells: string[], fromCol: number, maxCols: number): string[] {
-  if (fromCol <= 1 && maxCols >= cells.length) return cells;
-  return cells.slice(fromCol - 1, fromCol - 1 + maxCols);
-}
-
-function parseRowCells(rowXml: string, shared: string[], colCap: number = XLSX_MAX_COLS): string[] {
+function parseRowCells(rowXml: string, shared: string[], fromCol = 1, maxCols = XLSX_MAX_COLS): string[] {
+  // Round 10 reopen: placement is by ABSOLUTE column ref directly into a
+  // viewport-local slot (local = absoluteCol - (fromCol-1)). No padding from
+  // column A to the window origin and no absolute column ceiling — a range
+  // starting at IW works with a working set proportional to the WINDOW, not
+  // to fromCol.
   const cells: string[] = [];
+  let unrefSlot = 0;
   // Namespace-tolerant cell matchers: engine sheets use <x:c>/<x:v>/<x:is>.
   // The open-tag alternative requires a non-`/` before `>` so a self-closed
   // cell can never swallow the NEXT cell's content up to its close tag —
   // that misparse chained the follower's value into blank cells (round 8).
-  // colCap widens only for scoped ranges whose origin lies beyond the
-  // default 24-column window (round 10).
   const cellRe =
     /<(?:[\w.-]+:)?c ([^>]*[^/>])>[\s\S]*?<\/(?:[\w.-]+:)?c>|<(?:[\w.-]+:)?c ([^>]*?)\/>/g;
   for (const m of rowXml.matchAll(cellRe)) {
@@ -224,11 +218,12 @@ function parseRowCells(rowXml: string, shared: string[], colCap: number = XLSX_M
       const inline = cellXml.match(/<(?:[\w.-]+:)?is>[\s\S]*?<\/(?:[\w.-]+:)?is>/);
       if (inline) value = concatenatedTagTexts(inline[0], "t");
     }
-    const colIndex = ref ? columnToIndex(ref) : cells.length;
-    while (cells.length < colIndex && cells.length < colCap) cells.push("");
-    if (cells.length < colCap) cells.push(value);
-    if (cells.length >= colCap) break;
+    const absoluteCol = ref ? columnToIndex(ref) : fromCol - 1 + unrefSlot++;
+    const local = absoluteCol - (fromCol - 1);
+    if (local < 0 || local >= maxCols) continue; // outside the window: skip, never pad
+    cells[local] = value;
   }
+  for (let i = 0; i < cells.length; i++) if (cells[i] === undefined) cells[i] = "";
   return cells;
 }
 
@@ -241,13 +236,17 @@ function columnToIndex(letters: string): number {
 export async function renderPptxOutline(path: string, scope?: PreviewScope): Promise<PreviewOutline> {
   // Round 10 scoped windowing: the slide anchor opens the window at the
   // requested 1-based slide; maxEntries caps it. The hard ceiling stays.
+  // Round 10 reopen: an anchor beyond the deck clamps to the LAST slide —
+  // the same policy as the engine outline/SVG window (svgWindowOf), never
+  // an empty outline in one view and a last-page window in another.
   const anchor = Math.max(1, Math.floor(scope?.location?.slide ?? 1));
   const maxSlides = Math.min(PPTX_MAX_SLIDES, Math.max(1, scope?.maxEntries ?? PPTX_MAX_SLIDES));
   const index = await readZipIndex(path);
-  const slideEntries = index.entries
+  const all = index.entries
     .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.name))
-    .sort((a, b) => slideNo(a.name) - slideNo(b.name))
-    .filter((e) => slideNo(e.name) >= anchor && slideNo(e.name) < anchor + maxSlides);
+    .sort((a, b) => slideNo(a.name) - slideNo(b.name));
+  const inWindow = all.filter((e) => slideNo(e.name) >= anchor && slideNo(e.name) < anchor + maxSlides);
+  const slideEntries = inWindow.length > 0 ? inWindow : all.slice(-1);
 
   const slides: Array<{ index: number; shapes: Array<{ name?: string; text?: string }> }> = [];
   for (const entry of slideEntries) {

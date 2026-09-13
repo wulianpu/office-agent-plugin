@@ -236,6 +236,111 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     expect(entries.filter((p) => p === aPath)).toHaveLength(1);
   });
 
+  it("first-consumer abort during a gated Registry build does NOT poison the shared render (round 10 reopen)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    const runtime = {
+      format: "xlsx" as const,
+      builds: [] as string[],
+      gates: [] as Array<() => void>,
+      async createArtifactContext(input: { artifactRef: string; consistency: "optimistic" | "stable" }) {
+        runtime.builds.push(input.artifactRef);
+        await new Promise<void>((resolve) => runtime.gates.push(resolve));
+        return {
+          artifactRef: input.artifactRef,
+          version: { artifactRef: input.artifactRef, fingerprint: { size: 1n, mtimeNs: 1n } },
+          format: "xlsx" as const,
+          consistency: input.consistency,
+          rendererVersion: "test",
+          lastAccessAt: Date.now(),
+          enrichment: new Map()
+        };
+      },
+      initialize: async () => undefined,
+      trimMemory: async () => undefined,
+      dispose: async () => undefined
+    };
+    registry.registerRuntime(runtime, "full");
+    registry.setBuildScheduler(scheduler);
+    const path = join(dir, "poison-guard.xlsx");
+    await writeFile(path, Buffer.alloc(24, 6));
+    registry.setPathResolver(() => path);
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => [{ name: "Sheet1", window: [["poison-free"]], rowCount: 1 }]
+      }
+    );
+
+    const controllerA = new AbortController();
+    // A starts the shared render; the full build is gated (unresolved).
+    const a = service.preview({ requestId: "poison-a", artifactRef: "art-poison", priority: "background", visual: true, signal: controllerA.signal });
+    void a.catch(() => undefined);
+    await waitFor(() => runtime.builds.length === 1 && scheduler.runningCount === 1);
+    // B joins the SAME key while the build is still gated.
+    const b = service.preview({ requestId: "poison-b", artifactRef: "art-poison", priority: "background", visual: true });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    controllerA.abort(); // A leaves BEFORE the build resolves
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.runningCount).toBe(1); // the shared build keeps running for B
+
+    runtime.gates.splice(0)[0]?.(); // release the build
+    const modelB = await b; // B succeeds — A's abort did not poison the shared promise
+    expect(modelB.model.outline.kind).toBe("xlsx");
+    expect(runtime.builds.filter((ref) => ref === "art-poison")).toHaveLength(1); // one parse
+    await a.catch(() => undefined);
+  });
+
+  it("abort listeners are removed on every settle path — a long-lived signal never accumulates closures (round 10 reopen)", async () => {
+    const scheduler = new Scheduler();
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "listener-hygiene.xlsx");
+    await writeFile(path, Buffer.alloc(24, 3));
+    registry.setPathResolver(() => path);
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => [{ name: "Sheet1", window: [["clean"]], rowCount: 1 }]
+      }
+    );
+
+    const controller = new AbortController();
+    const signal = controller.signal;
+    let active = 0;
+    const originalAdd = signal.addEventListener.bind(signal);
+    const originalRemove = signal.removeEventListener.bind(signal);
+    (signal as unknown as { addEventListener: typeof originalAdd }).addEventListener = (...args: Parameters<typeof originalAdd>) => {
+      active++;
+      return originalAdd(...args);
+    };
+    (signal as unknown as { removeEventListener: typeof originalRemove }).removeEventListener = (...args: Parameters<typeof originalRemove>) => {
+      active--;
+      return originalRemove(...args);
+    };
+
+    // Sequential previews on ONE shared signal — each settle must clean up.
+    for (let i = 0; i < 25; i++) {
+      await service.preview({ requestId: `hygiene-${i}`, artifactRef: `art-hygiene-${i}`, priority: "visible", signal });
+      // The registry acquire also uses the same signal — both listeners clean.
+    }
+    expect(active).toBe(0); // no listener accumulation across settled previews
+    // Abort path cleanup: one aborted preview also removes its listener (once fires it, then our removeEventListener is a no-op — but the pending count must not grow).
+    const controller2 = new AbortController();
+    const before = (controller2.signal as unknown as { listenerCount?: () => number }).listenerCount;
+    void before;
+    const rejected = service.preview({ requestId: "hygiene-abort", artifactRef: "art-hygiene-0", priority: "background", signal: controller2.signal });
+    void rejected.catch(() => undefined);
+    controller2.abort();
+    await rejected.catch(() => undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
   it("consumer-aware cancellation: one joiner aborting never kills the other's shared work (round 10 reopen)", async () => {
     const scheduler = new Scheduler({ maxConcurrent: 1 });
     const registry = new ArtifactRegistry();

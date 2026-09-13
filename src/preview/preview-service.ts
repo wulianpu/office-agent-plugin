@@ -52,6 +52,10 @@ interface InflightRender {
   handles: SharedHandle[];
   highestIndex: number;
   consumers: Set<string>;
+  /** Round 10 reopen: the seed registry acquire carries THIS controller's
+   *  signal — aborted only when the last consumer leaves. A personal
+   *  consumer abort must never poison the shared build for later joiners. */
+  lifecycle: AbortController;
 }
 
 /**
@@ -77,12 +81,15 @@ function outlineFromGenOffice(context: ArtifactContext, scope?: PreviewScope): P
   if (context.format === "pptx") {
     const deck = GenOfficePptxFormatRuntime.deckOf(context);
     if (!deck) return undefined;
-    const anchor = Math.max(0, Math.floor((scope?.location?.slide ?? 1) - 1));
+    // Round 10 reopen: outline and SVG derive their slide window from the
+    // SAME svgWindowOf clamp — an out-of-range anchor yields "last slide"
+    // in BOTH views, never an empty outline next to a last-page SVG.
     const maxSlides = Math.min(200, Math.max(1, scope?.maxEntries ?? 200));
+    const { from, count } = svgWindowOf(deck.slides.length, scope, maxSlides);
     return {
       kind: "pptx",
-      slides: deck.slides.slice(anchor, anchor + maxSlides).map((slide, i) => ({
-        index: anchor + i + 1,
+      slides: deck.slides.slice(from, from + count).map((slide, i) => ({
+        index: from + i + 1,
         shapes: slide.elements
           .slice(0, 50)
           .map((element) => ({ name: element.name, text: elementText(element) || undefined }))
@@ -231,39 +238,62 @@ export class PreviewService {
       promise: undefined as never,
       handles: [],
       highestIndex: SCHEDULER_PRIORITIES.indexOf(PRIORITY_MAP[request.priority]),
-      consumers: new Set<string>()
+      consumers: new Set<string>(),
+      lifecycle: new AbortController()
     };
     if (first) {
       this.inflightDedup.set(cacheKeyString, shared);
-      // The FIRST consumer's acquire also seeds the shared render with its
-      // context lease; the lease is released when the shared render settles.
+      // The seed acquire belongs to the SHARED ENTRY, never to a personal
+      // consumer signal (round 10 reopen): the first consumer aborting
+      // mid-build must not poison the shared render later joiners rely on.
+      // lifecycle aborts only when the LAST consumer leaves.
       const seed = this.registry.acquire({
         artifactRef: request.artifactRef,
         format,
         consistency: "optimistic",
         profile: request.visual ? "full" : "metadata",
         priority: PRIORITY_MAP[request.priority],
-        consumer: consumerId,
-        signal: request.signal
+        consumer: `${consumerId}#seed`,
+        signal: shared.lifecycle.signal
       });
       shared.promise = this.runSharedRender(shared, request, format, path, cacheKeyString, fingerprint, scopeKey, seed);
+      // Guard: if every awaiter raced away on a personal abort, a later
+      // shared rejection must not surface as unhandled.
+      void shared.promise.catch(() => undefined);
     }
 
     // Every consumer (first included) registers itself. A detaching consumer
-    // removes only ITSELF; the shared queued work is cancelled when the LAST
-    // consumer leaves — matching the registry's build semantics.
+    // removes only ITSELF; the shared queued work and seed build are
+    // cancelled when the LAST consumer leaves — matching registry semantics.
     shared.consumers.add(consumerId);
     this.promoteInflight(shared, request.priority);
+
+    // A personal abort cancels only THIS consumer's wait (race rejection) —
+    // never the shared render others still rely on. The listener is removed
+    // on every settle path (success/error/abort), so a long-lived signal
+    // never accumulates closures.
+    let rejectPersonal: ((error: Error) => void) | undefined;
+    const personal = new Promise<never>((_, reject) => {
+      rejectPersonal = reject;
+    });
+    void personal.catch(() => undefined); // race loser stays quiet
+    let onAbort: (() => void) | undefined;
     if (request.signal) {
-      const detach = () => {
+      onAbort = () => {
         shared.consumers.delete(consumerId);
         if (shared.consumers.size === 0) {
+          shared.lifecycle.abort();
           for (const handle of shared.handles) handle.cancel();
         }
+        rejectPersonal?.(new DOMException("consumer aborted", "AbortError"));
       };
-      if (request.signal.aborted) detach();
-      else request.signal.addEventListener("abort", detach, { once: true });
+      if (!request.signal.aborted) {
+        request.signal.addEventListener("abort", onAbort, { once: true });
+      }
     }
+    const awaited: Promise<PreviewModel> = request.signal
+      ? Promise.race([shared.promise, personal])
+      : shared.promise;
 
     // Joiners acquire the registry context themselves: the acquire JOINS the
     // same build (no duplicate parse) and promotes a still-queued build to
@@ -281,10 +311,12 @@ export class PreviewService {
           signal: request.signal
         });
     try {
-      return await shared.promise;
+      if (request.signal?.aborted && onAbort) onAbort(); // pre-aborted
+      return await awaited;
     } finally {
       ownLease?.release();
       shared.consumers.delete(consumerId);
+      if (onAbort && request.signal) request.signal.removeEventListener("abort", onAbort);
     }
   }
 

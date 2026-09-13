@@ -116,7 +116,11 @@ describe("ArtifactRegistry build scheduling (round 10, issue #4)", () => {
       runtime.releaseOne();
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
-    expect(runtime.builds.slice(1)).toEqual([files[0]!.ref, files[1]!.ref, files[2]!.ref]);
+    // Equal-priority background builds have NO guaranteed relative order
+    // (each acquire awaits its own stat) — only the VISIBLE-first guarantee
+    // and the set of executed builds are asserted.
+    expect(runtime.builds.slice(1)).toHaveLength(3);
+    expect(runtime.builds.slice(1)).toEqual(expect.arrayContaining([files[0]!.ref, files[1]!.ref, files[2]!.ref]));
     for (let i = 0; i < 4; i++) runtime.releaseOne();
 
     const leases = await Promise.all([bg0, bg1, bg2, bg3Promise, join]);

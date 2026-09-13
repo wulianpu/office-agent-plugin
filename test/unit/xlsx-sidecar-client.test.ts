@@ -64,20 +64,26 @@ function makeClient(options?: { requestTimeoutMs?: number; unhealthyCooldownMs?:
 }
 
 describe("sidecarPreviewWindow range origin (round 10 reopen)", () => {
-  it("forwards the 1-based range as native 0-based read coordinates", async () => {
+  it("forwards the 1-based range as native 0-based read coordinates AND rebases absolute responses (round 10 reopen)", async () => {
     const ranges: Array<Record<string, number>> = [];
     const fake = {
       open: async () => ({
         sessionId: "s",
         sheets: [{ id: "sh1", name: "Data", rowCount: 500, columnCount: 60 }]
       }),
+      // Native filters by range but returns ABSOLUTE worksheet coordinates.
       readRange: async (_s: string, _id: string, range: Record<string, number>) => {
         ranges.push(range);
-        return { cells: [] };
+        return {
+          cells: [
+            { row: 9, column: 3, value: "D10" },
+            { row: 29, column: 5, value: "F30" }
+          ]
+        };
       },
       close: async () => undefined
     } as unknown as XlsxSidecarClient;
-    await sidecarPreviewWindow(fake, "book.xlsx", {
+    const sheets = await sidecarPreviewWindow(fake, "book.xlsx", {
       sheet: "Data",
       range: { fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 },
       maxRows: 21,
@@ -85,6 +91,21 @@ describe("sidecarPreviewWindow range origin (round 10 reopen)", () => {
     });
     // D10 (1-based) is native (row 9, col 3); the window spans 21x3.
     expect(ranges[0]).toEqual({ startRow: 9, endRow: 29, startColumn: 3, endColumn: 5 });
+    // Rebased to viewport-local: absolute (9,3) → window[0][0]; (29,5) → window[20][2].
+    // Pre-fix these cells were DROPPED as col >= maxCols.
+    expect(sheets[0]!.window[0]![0]).toBe("D10");
+    expect(sheets[0]!.window[20]![2]).toBe("F30");
+    expect(sheets[0]!.window).toHaveLength(21);
+  });
+
+  it("A1-origin windows keep their legacy mapping", async () => {
+    const fake = {
+      open: async () => ({ sessionId: "s", sheets: [{ id: "sh1", name: "S", rowCount: 50 }] }),
+      readRange: async () => ({ cells: [{ row: 0, column: 1, value: "B1" }] }),
+      close: async () => undefined
+    } as unknown as XlsxSidecarClient;
+    const sheets = await sidecarPreviewWindow(fake, "book.xlsx", { maxRows: 5, maxCols: 4 });
+    expect(sheets[0]!.window[0]![1]).toBe("B1");
   });
 
   it("default window still reads from the origin (0,0)", async () => {

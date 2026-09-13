@@ -297,7 +297,11 @@ export async function sidecarPreviewWindow(
           })
         );
       result = await result;
-      out.push({ name: sheet.name, window: normalizeWindow(result, maxRows, maxCols), rowCount: sheet.rowCount });
+      out.push({
+        name: sheet.name,
+        window: normalizeWindow(result, maxRows, maxCols, startRow0, startCol0),
+        rowCount: sheet.rowCount
+      });
     }
   } finally {
     await client.close(opened.sessionId).catch(() => undefined);
@@ -306,7 +310,21 @@ export async function sidecarPreviewWindow(
 }
 
 /** Scatter the engine's sparse cell records into a dense 2D string window. */
-function normalizeWindow(result: SidecarRangeResult, maxRows: number, maxCols: number): string[][] {
+/**
+ * Scatter the engine's sparse cell records into a dense viewport-local grid.
+ * The native engine filters by range but does NOT rebase coordinates —
+ * cell.row/column stay ABSOLUTE worksheet 0-based values, so the window
+ * origin must be subtracted before any bounds check or placement (round 10
+ * reopen: D10:F30's cells at column 3..5 were previously dropped as
+ * "beyond maxCols=3").
+ */
+function normalizeWindow(
+  result: SidecarRangeResult,
+  maxRows: number,
+  maxCols: number,
+  startRow0 = 0,
+  startCol0 = 0
+): string[][] {
   const grid: string[][] = [];
   const ensure = (row: number) => {
     while (grid.length <= row) grid.push([]);
@@ -314,9 +332,9 @@ function normalizeWindow(result: SidecarRangeResult, maxRows: number, maxCols: n
   };
   if (Array.isArray(result.cells)) {
     for (const record of result.cells as Array<{ row?: number; column?: number; value?: unknown }>) {
-      const row = record.row ?? 0;
-      const col = record.column ?? 0;
-      if (row >= maxRows || col >= maxCols) continue;
+      const row = (record.row ?? 0) - startRow0;
+      const col = (record.column ?? 0) - startCol0;
+      if (row < 0 || row >= maxRows || col < 0 || col >= maxCols) continue;
       const line = ensure(row);
       while (line.length <= col) line.push("");
       line[col] = record.value === null || record.value === undefined ? "" : String(record.value);
