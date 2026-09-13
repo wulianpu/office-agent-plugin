@@ -125,34 +125,33 @@ function parseTag(tag: string): { name: string; attrs: Array<[string, string]> }
   return { name, attrs };
 }
 
-/** Split a large string across row boundaries `<row ...>…</row>`.
- *  Namespace-tolerant: engine sheets write `<x:row>…</x:row>`. */
-export function splitRows(chunk: string, carry: { pending: string }): string[] {
-  const rows: string[] = [];
+/**
+ * Split a stream into complete `<tag ...>…</tag>` records (namespace-tolerant:
+ * `<x:row>`/`<x:si>` match too), carrying partial tags across chunk
+ * boundaries. Chunks may end mid open-tag — the tail is carried from its
+ * last `<` only when no `>` follows it (provably partial), so records are
+ * never re-emitted.
+ */
+export function splitTagged(chunk: string, tag: string, carry: { pending: string }): string[] {
+  const records: string[] = [];
   let data = carry.pending + chunk;
   carry.pending = "";
-  const rowOpen = /<(?:[\w.-]+:)?row\b/g;
-  const rowClose = /<\/(?:[\w.-]+:)?row>/g;
+  const open = new RegExp(`<(?:[\\w.-]+:)?${tag}\\b`, "g");
+  const close = new RegExp(`</(?:[\\w.-]+:)?${tag}>`, "g");
   let lastScan = 0;
   for (;;) {
-    rowOpen.lastIndex = lastScan;
-    const open = rowOpen.exec(data);
-    if (!open) break;
-    rowClose.lastIndex = open.index + open[0].length;
-    const close = rowClose.exec(data);
-    if (!close) {
-      carry.pending = data.slice(open.index);
+    open.lastIndex = lastScan;
+    const opened = open.exec(data);
+    if (!opened) break;
+    close.lastIndex = opened.index + opened[0].length;
+    const closed = close.exec(data);
+    if (!closed) {
+      carry.pending = data.slice(opened.index);
       break;
     }
-    rows.push(data.slice(open.index, close.index + close[0].length));
-    lastScan = close.index + close[0].length;
+    records.push(data.slice(opened.index, closed.index + closed[0].length));
+    lastScan = closed.index + closed[0].length;
   }
-  // Partial-tag carry (round 8): a chunk may end mid open-tag (`<x:r` of
-  // `<x:row`) even after complete rows were extracted. The old `lastScan===0`
-  // guard dropped that tail — a chunk-boundary-dependent silent row loss.
-  // Carry from the last `<` only when no `>` follows it in the unconsumed
-  // remainder (i.e. it is provably a partial tag); a complete tag in the
-  // tail carries nothing, so extracted rows are never re-emitted.
   if (!carry.pending) {
     const unconsumed = data.slice(lastScan);
     const lastLt = unconsumed.lastIndexOf("<");
@@ -160,5 +159,26 @@ export function splitRows(chunk: string, carry: { pending: string }): string[] {
       carry.pending = unconsumed.slice(lastLt);
     }
   }
-  return rows;
+  return records;
+}
+
+/** Split a large string across row boundaries `<row ...>…</row>`. */
+export function splitRows(chunk: string, carry: { pending: string }): string[] {
+  return splitTagged(chunk, "row", carry);
+}
+
+/**
+ * Concatenate ALL inner `<tag>` texts of one COMPLETE record, namespace-
+ * tolerant and entity-decoded. Shared strings use this over `<si>`: a Rich
+ * Text `<si>` holds many `<r><t>` runs that must join into ONE entry —
+ * indexing per `<t>` silently shifted every later index (round 9).
+ */
+export function concatenatedTagTexts(record: string, tag: string): string {
+  const inner = new RegExp(
+    `<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?>([^<]*)</(?:[\\w.-]+:)?${tag}>`,
+    "g"
+  );
+  let text = "";
+  for (const m of record.matchAll(inner)) text += decodeXmlEntities(m[1] ?? "");
+  return text;
 }

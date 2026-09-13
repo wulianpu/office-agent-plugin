@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalizeXml,
+  concatenatedTagTexts,
   extractTagTexts,
-  splitRows
+  splitRows,
+  splitTagged
 } from "../../src/support/xml-lite.js";
 
 describe("xml-lite", () => {
@@ -60,5 +62,37 @@ describe("xml-lite", () => {
     const carry2 = { pending: "" };
     expect(splitRows('<row r="1"><c/></ro', carry2)).toEqual([]);
     expect(splitRows('w>', carry2)).toEqual(['<row r="1"><c/></row>']);
+  });
+
+  it("splitTagged reassembles <si> records identically across every chunk boundary (round 9)", () => {
+    const xml =
+      "<sst><si><r><t>Hello </t></r><r><t>World</t></r></si><si><t>Next</t></si></sst>";
+    const expected = [
+      "<si><r><t>Hello </t></r><r><t>World</t></r></si>",
+      "<si><t>Next</t></si>"
+    ];
+    for (let cut = 1; cut < xml.length - 1; cut++) {
+      const carry = { pending: "" };
+      const head = splitTagged(xml.slice(0, cut), "si", carry);
+      const tail = splitTagged(xml.slice(cut), "si", carry);
+      expect([...head, ...tail]).toEqual(expected);
+    }
+  });
+
+  it("splitTagged is namespace-tolerant for records", () => {
+    const carry = { pending: "" };
+    expect(splitTagged("<x:si><x:t>a</x:t></x:si>", "si", carry)).toEqual([
+      "<x:si><x:t>a</x:t></x:si>"
+    ]);
+  });
+
+  it("concatenatedTagTexts joins rich-text runs and decodes entities", () => {
+    expect(concatenatedTagTexts("<si><r><t>Hello </t></r><r><t>W&amp;W</t></r></si>", "t")).toBe(
+      "Hello W&W"
+    );
+    expect(concatenatedTagTexts("<x:si><x:r><x:t>Hi </x:t></x:r><x:t>There</x:t></x:si>", "t")).toBe(
+      "Hi There"
+    );
+    expect(concatenatedTagTexts("<si><t>Next</t></si>", "t")).toBe("Next");
   });
 });

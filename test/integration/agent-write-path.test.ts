@@ -234,5 +234,58 @@ describe.skipIf(!engineUp || process.platform !== "win32")(
         await rm(longDir, { recursive: true, force: true }).catch(() => undefined);
       }
     }, 120_000);
+
+    it("short BASENAME alias of an existing file: one resident identity across aliases (round 9)", async (ctx) => {
+      // Round 9 (issue #3): the JS realpath never expanded 8.3 names at all;
+      // longFormPath now resolves the WHOLE path natively, so a short
+      // BASENAME alias (PRESEN~1.DOCX) and the long name are ONE identity.
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const { mkdtemp, rm } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const run = promisify(execFile);
+
+      const dir = await mkdtemp(join(tmpdir(), "basename-alias-"));
+      const longName = "Presentation Q3 2026.docx";
+      const longPath = join(dir, longName);
+      try {
+        const { OfficeCliAdapter } = await import("../../src/agent/officecli/officecli-adapter.js");
+        const adapter = new OfficeCliAdapter({ timeoutMs: 60_000 });
+        await adapter.run(["create", longPath, "--json"]).catch(() => undefined);
+        await adapter.runBatchStandalone(longPath, [
+          { command: "add", parent: "/body", type: "paragraph", props: { text: "alias probe" } }
+        ]);
+
+        let shortPath: string;
+        try {
+          shortPath = (
+            await run("powershell", [
+              "-NoProfile",
+              "-Command",
+              `(New-Object -ComObject Scripting.FileSystemObject).GetFile('${longPath.replace(/\\/g, "\\\\")}').ShortPath`
+            ])
+          ).stdout.trim();
+        } catch {
+          shortPath = longPath;
+        }
+        // No 8.3 aliases on this volume (or name already 8.3-fit) — skip.
+        if (shortPath === longPath) ctx.skip();
+        expect(shortPath).not.toBe(longPath); // a REAL basename alias exists
+
+        // Operate through the short alias — the adapter canonicalizes both
+        // forms to one engine identity.
+        const viaShort = await adapter.get(shortPath, "/body/paragraph[1]");
+        expect(JSON.stringify(viaShort)).toContain("alias probe");
+        // Closing via EITHER alias releases the SAME resident.
+        await adapter.close(shortPath).catch(() => undefined);
+        await adapter.close(longPath).catch(() => undefined);
+        const again = await adapter.get(longPath, "/body/paragraph[1]");
+        expect(JSON.stringify(again)).toContain("alias probe");
+        await adapter.close(longPath).catch(() => undefined);
+      } finally {
+        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }, 120_000);
   }
 );

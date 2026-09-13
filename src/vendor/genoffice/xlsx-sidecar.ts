@@ -54,22 +54,57 @@ export function defaultSidecarPath(): string {
   );
 }
 
+interface PendingRequest {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+const STDERR_RING_BYTES = 8 * 1024;
+/** Default per-request deadline: a live-but-wedged sidecar must let the
+ *  caller fall back to the JS renderer in seconds-to-tens-of-seconds,
+ *  never block a preview indefinitely (round 9, P1-high). */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+/** Cooldown after a hard timeout: fail fast to the fallback path, then allow
+ *  one fresh respawn attempt (bounded wedge cost, no permanent latch). */
+const UNHEALTHY_COOLDOWN_MS = 30_000;
+
 export class XlsxSidecarClient {
   private child?: ChildProcessWithoutNullStreams;
-  private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pending = new Map<string, PendingRequest>();
   private seq = 0;
   private startError?: Error;
+  private unhealthyUntil = 0;
+  private readonly stderrRing: string[] = [];
 
-  constructor(readonly exePath: string = process.env.XLSX_SIDECAR_PATH ?? defaultSidecarPath()) {}
+  constructor(
+    readonly exePath: string = process.env.XLSX_SIDECAR_PATH ?? defaultSidecarPath(),
+    private readonly options: { requestTimeoutMs?: number; unhealthyCooldownMs?: number } = {}
+  ) {}
 
   get available(): boolean {
     return existsSync(this.exePath);
   }
 
+  /** Bounded recent stderr for diagnostics — never an unbounded string. */
+  recentStderr(): string {
+    return this.stderrRing.join("");
+  }
+
+  /** In-flight request count (introspection for tests/telemetry). */
+  pendingCount(): number {
+    return this.pending.size;
+  }
+
   private ensureStarted(): void {
-    if (this.child || this.startError) {
-      if (this.startError) throw this.startError;
-      return;
+    if (this.startError) throw this.startError;
+    if (this.child) return;
+    // Cooldown after a hard timeout: fail fast so previews use the JS
+    // fallback immediately; a fresh spawn attempt is allowed afterwards.
+    if (Date.now() < this.unhealthyUntil) {
+      throw new Error(
+        `xlsx sidecar cooling down after timeout (retry in ${Math.ceil((this.unhealthyUntil - Date.now()) / 1000)}s)`
+      );
     }
     // Fast-fail before spawning: a missing binary must reject the FIRST
     // request immediately — spawn() reports ENOENT asynchronously via the
@@ -80,7 +115,22 @@ export class XlsxSidecarClient {
       throw this.startError;
     }
     try {
-      this.child = spawn(this.exePath, [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as ChildProcessWithoutNullStreams;
+      this.child = this.startChild();
+      // Drain stderr into a bounded ring: an unread pipe fills and the OS
+      // backpressures the child into a live-but-wedged state. Never accrue
+      // an unbounded string.
+      this.child.stderr.on("data", (chunk: Buffer) => {
+        this.stderrRing.push(chunk.toString("utf8"));
+        let bytes = this.stderrRing.reduce((n, part) => n + part.length, 0);
+        while (this.stderrRing.length > 1 && bytes > STDERR_RING_BYTES) {
+          bytes -= this.stderrRing.shift()!.length;
+        }
+      });
+      // A dead stdin (EPIPE after a crash) must settle pending requests —
+      // child-level error/exit events alone are not guaranteed to fire first.
+      this.child.stdin.on("error", (error) => {
+        this.failAllPending(new Error(`sidecar stdin error: ${String(error)}`));
+      });
       const rl = createInterface({ input: this.child.stdout! });
       rl.on("line", (line) => {
         if (!line.trim()) return;
@@ -89,6 +139,7 @@ export class XlsxSidecarClient {
           const entry = this.pending.get(response.requestId);
           if (!entry) return;
           this.pending.delete(response.requestId);
+          clearTimeout(entry.timer);
           if (response.ok) entry.resolve(response.result);
           else entry.reject(new Error(`sidecar ${response.error?.code}: ${response.error?.message}`));
         } catch {
@@ -99,13 +150,11 @@ export class XlsxSidecarClient {
         // Spawn/early-lifecycle failure: settle every pending request NOW and
         // latch the error so later calls fail fast instead of hanging.
         this.startError = error instanceof Error ? error : new Error(String(error));
-        for (const [, entry] of this.pending) entry.reject(this.startError);
-        this.pending.clear();
+        this.failAllPending(this.startError);
         this.child = undefined;
       });
       this.child.on("exit", () => {
-        for (const [, entry] of this.pending) entry.reject(new Error("sidecar exited"));
-        this.pending.clear();
+        this.failAllPending(new Error("sidecar exited"));
         this.child = undefined;
       });
     } catch (error) {
@@ -114,14 +163,55 @@ export class XlsxSidecarClient {
     }
   }
 
-  private request<T>(command: string, payload: Record<string, unknown>): Promise<T> {
+  /** Spawn the native process — protected so deterministic tests substitute
+   *  a fake child without a real executable (round 9). */
+  protected startChild(): ChildProcessWithoutNullStreams {
+    return spawn(this.exePath, [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as ChildProcessWithoutNullStreams;
+  }
+
+  private async request<T>(command: string, payload: Record<string, unknown>): Promise<T> {
     this.ensureStarted();
     const requestId = `req-${++this.seq}-${randomUUID().slice(0, 8)}`;
     const envelope = { version: PROTOCOL_VERSION, requestId, command, ...payload };
+    const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     return new Promise<T>((resolvePromise, rejectPromise) => {
-      this.pending.set(requestId, { resolve: resolvePromise as (v: unknown) => void, reject: rejectPromise });
-      this.child!.stdin.write(`${JSON.stringify(envelope)}\n`);
+      const entry = {
+        resolve: (value: unknown) => {
+          clearTimeout(entry.timer);
+          resolvePromise(value as T);
+        },
+        reject: (error: Error) => {
+          clearTimeout(entry.timer);
+          rejectPromise(error);
+        },
+        timer: setTimeout(() => {
+          this.pending.delete(requestId);
+          // Live-but-wedged: kill the process ('exit' settles everything
+          // still pending) and latch a cooldown so subsequent previews fail
+          // fast into the JS renderer instead of paying another timeout.
+          this.unhealthyUntil =
+            Date.now() + (this.options.unhealthyCooldownMs ?? UNHEALTHY_COOLDOWN_MS);
+          entry.reject(new Error(`sidecar request timeout after ${timeoutMs}ms: ${command}`));
+          this.child?.kill();
+        }, timeoutMs) as NodeJS.Timeout
+      };
+      this.pending.set(requestId, entry);
+      try {
+        this.child!.stdin.write(`${JSON.stringify(envelope)}\n`);
+      } catch (error) {
+        this.pending.delete(requestId);
+        clearTimeout(entry.timer);
+        rejectPromise(new Error(`sidecar stdin write failed: ${String(error)}`));
+      }
     });
+  }
+
+  private failAllPending(error: Error): void {
+    for (const [, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+    this.pending.clear();
   }
 
   open(path: string, locale = "en_US"): Promise<SidecarOpenResult> {
@@ -139,6 +229,7 @@ export class XlsxSidecarClient {
   async dispose(): Promise<void> {
     const child = this.child;
     this.child = undefined;
+    this.failAllPending(new Error("sidecar disposed"));
     if (!child) return;
     child.stdin.end();
     child.kill();

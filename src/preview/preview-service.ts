@@ -154,11 +154,24 @@ export class PreviewService {
         // context (deck / blocks); fall back to the streaming zip renderers.
         let outline = outlineFromGenOffice(lease.context);
         // §30: XLSX goes through the Rust sidecar when present (bounded
-        // viewport, workbook memory stays out of this process).
+        // viewport, workbook memory stays out of this process). Round 9 (P1):
+        // the native call runs as a Scheduler job under the SAME priority
+        // ladder and resource gating as everything else — unregulated
+        // background XLSX reads used to jump the queue straight into the
+        // single sidecar, starving later visible previews (PERF-08/10).
         if (!outline && format === "xlsx" && this.xlsxSidecar) {
-          outline = await this.xlsxSidecar
-            .previewWindow(path)
-            .then((sheets): PreviewOutline => ({
+          const sidecar = this.xlsxSidecar;
+          outline = await this.scheduler
+            .submit({
+              label: `preview-xlsx-sidecar:${request.artifactRef}`,
+              priority: PRIORITY_MAP[request.priority],
+              resources: { io: 1 },
+              run: async (signal) => {
+                if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+                return await sidecar.previewWindow(path);
+              }
+            })
+            .promise.then((sheets): PreviewOutline => ({
               kind: "xlsx",
               sheets: sheets.map((sheet) => ({
                 name: sheet.name,

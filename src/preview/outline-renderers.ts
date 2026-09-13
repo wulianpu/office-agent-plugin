@@ -5,7 +5,7 @@
  */
 
 import type { PreviewOutline } from "../contracts/preview.js";
-import { extractTagTexts, splitRows } from "../support/xml-lite.js";
+import { concatenatedTagTexts, decodeXmlEntities, extractTagTexts, splitRows, splitTagged } from "../support/xml-lite.js";
 import { readZipEntry, readZipIndex, streamZipEntry } from "../artifact/scanner/zip.js";
 
 const DOCX_MAX_BLOCKS = 400;
@@ -78,14 +78,20 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
     })
     .filter((s): s is { name: string; rid: string } => Boolean(s.name && s.rid));
 
-  // sharedStrings (bounded): map index → text.
+  // sharedStrings (bounded): the INDEX UNIT is <si>, not <t>. A Rich Text
+  // <si> carries multiple <r><t> runs that concatenate into ONE entry —
+  // per-<t> indexing shifted every later index after the first rich entry
+  // (round 9, P1-high). Streaming <si> records keep the 100k bound without
+  // materializing the workbook.
   const shared: string[] = [];
   if (index.entryByName.has("xl/sharedStrings.xml")) {
     const carry = { pending: "" };
     for await (const chunk of streamZipEntry(path, index, "xl/sharedStrings.xml")) {
-      for (const text of extractTagTexts(chunk.toString("utf8"), "t", carry)) {
-        if (shared.length < 100_000) shared.push(text);
+      for (const record of splitTagged(chunk.toString("utf8"), "si", carry)) {
+        if (shared.length >= 100_000) break;
+        shared.push(concatenatedTagTexts(record, "t"));
       }
+      if (shared.length >= 100_000) break;
     }
   }
 
@@ -154,10 +160,14 @@ function parseRowCells(rowXml: string, shared: string[]): string[] {
     if (vMatch) {
       const raw = vMatch[1]!;
       const isShared = /t="s"/.test(attrs);
-      value = isShared ? (shared[Number(raw)] ?? "") : raw;
+      // shared[] entries are already entity-decoded (concatenatedTagTexts);
+      // decode only the raw <v> literal here.
+      value = isShared ? (shared[Number(raw)] ?? "") : decodeXmlEntities(raw);
     } else {
-      const inline = cellXml.match(/<(?:[\w.-]+:)?is>\s*<(?:[\w.-]+:)?t[^>]*>([^<]*)<\/(?:[\w.-]+:)?t>/);
-      if (inline) value = inline[1]!;
+      // Inline string: may itself be Rich Text (<is><r><t>…</t></r>…</is>) —
+      // concatenate every run inside the <is>, entity-decoded (round 9).
+      const inline = cellXml.match(/<(?:[\w.-]+:)?is>[\s\S]*?<\/(?:[\w.-]+:)?is>/);
+      if (inline) value = concatenatedTagTexts(inline[0], "t");
     }
     const colIndex = ref ? columnToIndex(ref) : cells.length;
     while (cells.length < colIndex && cells.length < XLSX_MAX_COLS) cells.push("");

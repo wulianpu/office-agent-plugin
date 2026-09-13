@@ -15,18 +15,28 @@ import type { FileFingerprint } from "../contracts/artifact.js";
 import { OfficeRuntimeError } from "../contracts/document.js";
 
 /**
- * Canonical long-form path (dir via realpath + basename). Windows 8.3 short
- * paths (e.g. RUNNER~1 from %TEMP%) crash libuv's fs-event watcher (libuv
- * #5010 / node #63638) when ANY process watches them, and short/long aliases
- * of one file break path-keyed identities. Everything that reaches a
- * watcher, a child-process env or an engine invocation is normalized here.
+ * Canonical long-form path. Windows 8.3 short paths (e.g. RUNNER~1 from
+ * %TEMP%, or a short BASENAME alias like PRESEN~1.DOCX) crash libuv's
+ * fs-event watcher (libuv#5010 / node#63638) when watched, and short/long
+ * aliases of one file break path-keyed identities.
+ *
+ * Round 9 correction: the JS realpath does NOT expand 8.3 aliases at all
+ * (verified on Windows — it echoes the short path back); only the native
+ * implementation resolves to the OS final path. Expand the WHOLE path so a
+ * short alias in ANY component — including the final basename — maps to one
+ * canonical identity. Non-existent paths (create-before-exists) fall back to
+ * expanding every existing component and keeping the pending basename.
  */
 export function longFormPath(path: string): string {
   const absolute = resolve(path);
   try {
-    return join(realpathSync(dirname(absolute)), basename(absolute));
+    return realpathSync.native(absolute);
   } catch {
-    return absolute;
+    try {
+      return join(realpathSync.native(dirname(absolute)), basename(absolute));
+    } catch {
+      return absolute;
+    }
   }
 }
 

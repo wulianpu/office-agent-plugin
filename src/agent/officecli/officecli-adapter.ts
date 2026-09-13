@@ -209,10 +209,10 @@ export class OfficeCliAdapter {
       for (const key of ["TEMP", "TMP"] as const) {
         const value = env[key];
         if (typeof value === "string" && value) {
-          // The env value is a DIRECTORY — realpath the whole path so a short
-          // alias in ANY component (including the last) is expanded.
+          // The env value is a DIRECTORY — expand the whole path via the
+          // NATIVE realpath (the JS one does not resolve 8.3 aliases).
           try {
-            env[key] = realpathSync(value);
+            env[key] = realpathSync.native(value);
           } catch {
             // Nonexistent dir: leave as-is; the engine surfaces its own error.
           }
