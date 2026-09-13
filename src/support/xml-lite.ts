@@ -125,25 +125,30 @@ function parseTag(tag: string): { name: string; attrs: Array<[string, string]> }
   return { name, attrs };
 }
 
-/** Split a large string across regex-free row boundaries `<row ...>…</row>`. */
+/** Split a large string across row boundaries `<row ...>…</row>`.
+ *  Namespace-tolerant: engine sheets write `<x:row>…</x:row>`. */
 export function splitRows(chunk: string, carry: { pending: string }): string[] {
   const rows: string[] = [];
   let data = carry.pending + chunk;
   carry.pending = "";
-  let searchFrom = 0;
+  const rowOpen = /<(?:[\w.-]+:)?row\b/g;
+  const rowClose = /<\/(?:[\w.-]+:)?row>/g;
+  let lastScan = 0;
   for (;;) {
-    const openIdx = data.indexOf("<row", searchFrom);
-    if (openIdx < 0) break;
-    const closeIdx = data.indexOf("</row>", openIdx);
-    if (closeIdx < 0) {
-      carry.pending = data.slice(openIdx);
+    rowOpen.lastIndex = lastScan;
+    const open = rowOpen.exec(data);
+    if (!open) break;
+    rowClose.lastIndex = open.index + open[0].length;
+    const close = rowClose.exec(data);
+    if (!close) {
+      carry.pending = data.slice(open.index);
       break;
     }
-    rows.push(data.slice(openIdx, closeIdx + 6));
-    searchFrom = closeIdx + 6;
+    rows.push(data.slice(open.index, close.index + close[0].length));
+    lastScan = close.index + close[0].length;
   }
-  if (!carry.pending && searchFrom === 0) {
-    carry.pending = data.slice(Math.max(0, data.length - 6));
+  if (!carry.pending && lastScan === 0) {
+    carry.pending = data.slice(Math.max(0, data.length - 8));
   }
   return rows;
 }

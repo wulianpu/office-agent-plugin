@@ -78,7 +78,7 @@ describe.skipIf(!engineUp)("localhost preview host", () => {
     expect(png.length).toBeGreaterThan(2000);
   });
 
-  it("serves the sidecar-backed xlsx preview window via API", async () => {
+  it("serves the xlsx preview window via API (sidecar, or JS renderer without cargo)", async () => {
     const res = await fetch(base + `/api/preview/${xlsxRef}`);
     const body = (await res.json()) as {
       format: string;

@@ -21,6 +21,13 @@ const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
   })
   .catch(() => false);
 
+/** The Rust sidecar is a cargo build artifact (`npm run sidecar:build`) —
+ *  runners without cargo must skip the sidecar suites, not fail them; the
+ *  in-process JS renderer covers xlsx previews there instead. */
+const sidecarUp = await import("../../src/vendor/genoffice/xlsx-sidecar.js").then(
+  (m) => new m.XlsxSidecarClient().available
+);
+
 
 /** The large corpus file is the sidecar's meaningful workload; build on demand. */
 async function ensureLargeCorpus(): Promise<string> {
@@ -69,7 +76,7 @@ describe.skipIf(!engineUp)("pptx headless visual rendering (§P7)", () => {
   });
 });
 
-describe.skipIf(!engineUp)("xlsx Rust sidecar (§30)", () => {
+describe.skipIf(!engineUp || !sidecarUp)("xlsx Rust sidecar (§30)", () => {
   it("sidecar binary is built and reachable", () => {
     expect(ws.plugin.service.isXlsxSidecarAvailable()).toBe(true);
   });

@@ -66,7 +66,17 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
   const workbookXml = (
     await readZipEntry(path, index, "xl/workbook.xml", 16 * 1024 * 1024).catch(() => Buffer.alloc(0))
   ).toString("utf8");
-  const sheetTags = [...workbookXml.matchAll(/<sheet [^>]*name="([^"]+)"[^>]*r:id="(rId\d+)"/g)];
+  // Engine writers may namespace the tags (<x:sheet …>) and use arbitrary
+  // relationship ids (not just rIdN) — match the tag, then the attributes.
+  const sheetTags = [...workbookXml.matchAll(/<(?:[\w.-]+:)?sheet\b([^>]*?)\/?>/g)]
+    .map((m) => {
+      const attrs = m[1] ?? "";
+      return {
+        name: attrs.match(/\bname="([^"]+)"/)?.[1],
+        rid: attrs.match(/\br:id="([^"]+)"/)?.[1]
+      };
+    })
+    .filter((s): s is { name: string; rid: string } => Boolean(s.name && s.rid));
 
   // sharedStrings (bounded): map index → text.
   const shared: string[] = [];
@@ -83,18 +93,26 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
     await readZipEntry(path, index, "xl/_rels/workbook.xml.rels", 8 * 1024 * 1024).catch(() => Buffer.alloc(0))
   ).toString("utf8");
   const relTargets = new Map(
-    [...workbookRels.matchAll(/Id="(rId\d+)"[^>]*Target="([^"]+)"/g)].map((m) => [
-      m[1]!,
-      m[2]!.replace(/^worksheets\//, "worksheets/")
-    ])
+    [...workbookRels.matchAll(/<(?:[\w.-]+:)?Relationship\b([^>]*?)\/?>/g)]
+      .map((m) => {
+        const attrs = m[1] ?? "";
+        const id = attrs.match(/\bId="([^"]+)"/)?.[1];
+        const target = attrs.match(/\bTarget="([^"]+)"/)?.[1];
+        return id && target ? ([id, target.replace(/^\//, "")] as [string, string]) : undefined;
+      })
+      .filter((e): e is [string, string] => Boolean(e))
   );
 
   let sheetIdx = 0;
   for (const tag of sheetTags) {
     if (sheetIdx >= 4) break; // preview window covers the first sheets
-    const name = tag[1]!;
-    const target = relTargets.get(tag[2]!);
-    const part = target ? `xl/${target}` : `xl/worksheets/sheet${sheetIdx + 1}.xml`;
+    const name = tag.name;
+    const target = relTargets.get(tag.rid);
+    const part = target
+      ? target.startsWith("xl/")
+        ? target
+        : `xl/${target}`
+      : `xl/worksheets/sheet${sheetIdx + 1}.xml`;
     const window: string[][] = [];
     let rowCount = 0;
     if (index.entryByName.has(part)) {
@@ -118,18 +136,21 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
 
 function parseRowCells(rowXml: string, shared: string[]): string[] {
   const cells: string[] = [];
-  for (const m of rowXml.matchAll(/<c ([^>]*)>(?:.*?)<\/c>|<c ([^>]*)\/>/g)) {
+  // Namespace-tolerant cell matchers: engine sheets use <x:c>/<x:v>/<x:is>.
+  const cellRe = /<(?:[\w.-]+:)?c ([^>]*)>[\s\S]*?<\/(?:[\w.-]+:)?c>|<(?:[\w.-]+:)?c ([^>]*)\/>/g;
+  for (const m of rowXml.matchAll(cellRe)) {
     const attrs = (m[1] ?? m[2] ?? "") + ">";
     const refMatch = attrs.match(/r="([A-Z]+)\d+"/);
     const ref = refMatch?.[1] ?? "";
     let value = "";
-    const vMatch = rowXml.slice(m.index ?? 0).match(/<v>([^<]*)<\/v>/);
+    const rest = rowXml.slice(m.index ?? 0);
+    const vMatch = rest.match(/<(?:[\w.-]+:)?v>([^<]*)<\/(?:[\w.-]+:)?v>/);
     if (vMatch) {
       const raw = vMatch[1]!;
       const isShared = /t="s"/.test(attrs);
       value = isShared ? (shared[Number(raw)] ?? "") : raw;
     } else {
-      const inline = rowXml.slice(m.index ?? 0).match(/<is><t[^>]*>([^<]*)<\/t>/);
+      const inline = rest.match(/<(?:[\w.-]+:)?is>\s*<(?:[\w.-]+:)?t[^>]*>([^<]*)<\/(?:[\w.-]+:)?t>/);
       if (inline) value = inline[1]!;
     }
     const colIndex = ref ? columnToIndex(ref) : cells.length;
