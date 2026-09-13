@@ -28,6 +28,9 @@ class ControllableRuntime implements FormatRuntime {
   aborted = 0;
   /** When true, builds stay pending until the test resolves them via gate(). */
   pending = false;
+  /** When true, a pending build IGNORES its abort signal and resolves via
+   *  gate() anyway — models a runtime that races cancellation (ABA probe). */
+  ignoreAbort = false;
   private gates: Array<() => void> = [];
   initialize = vi.fn(async () => undefined);
   trimMemory = vi.fn(async () => undefined);
@@ -49,7 +52,9 @@ class ControllableRuntime implements FormatRuntime {
     }
     if (!this.pending) return context;
     return new Promise<ArtifactContext>((resolve, reject) => {
-      const onAbort = () => reject(new DOMException("aborted", "AbortError"));
+      const onAbort = () => {
+        if (!this.ignoreAbort) reject(new DOMException("aborted", "AbortError"));
+      };
       input.signal?.addEventListener("abort", onAbort, { once: true });
       this.gates.push(() => {
         input.signal?.removeEventListener("abort", onAbort);
@@ -58,15 +63,26 @@ class ControllableRuntime implements FormatRuntime {
     });
   }
 
-  gate(): void {
-    for (const g of this.gates.splice(0)) g();
+  /** Release the `count` OLDEST gated builds (default: all of them). */
+  gate(count: number = Number.POSITIVE_INFINITY): void {
+    for (const g of this.gates.splice(0, count)) g();
   }
 }
 
-/** Deterministic barrier: wait until a condition holds (stat timing varies). */
-async function waitFor(condition: () => boolean): Promise<void> {
-  for (let i = 0; i < 100 && !condition(); i++) {
-    await new Promise((resolve) => setImmediate(resolve));
+/**
+ * Deterministic barrier: the condition MUST hold within the deadline — on a
+ * slow CI host a fixed setImmediate budget expires before the consumers even
+ * join (the Windows red build: abort fired pre-join → solo-cancel → the
+ * gated rebuild hangs to the 120s test timeout). A timed-out wait now fails
+ * the test immediately instead of letting the racy sequence proceed.
+ */
+async function waitFor(condition: () => boolean, deadlineMs = 5_000): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitFor: condition not met within ${deadlineMs}ms — test sequencing is broken`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
 
@@ -148,5 +164,55 @@ describe("ArtifactRegistry (§21–§24, PERF-04/05/06)", () => {
     const second = await acquire(registry, "c2");
     second.release();
     expect(runtime.builds).toBe(1);
+  });
+
+  it("ABA: last-consumer abort → reacquire → old build settles late: new job survives, cancelled never cached", async () => {
+    const runtime = new ControllableRuntime();
+    runtime.pending = true;
+    runtime.ignoreAbort = true; // build #1 ignores the abort and RESOLVES late
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(runtime);
+    registry.setPathResolver(() => fixturePath);
+
+    // Job 1: the solo consumer aborts (last consumer) → cancelled + evicted.
+    const controller1 = new AbortController();
+    const promise1 = acquire(registry, "preview:old", controller1.signal);
+    await waitFor(() => registry.leaseCount() >= 1);
+    controller1.abort();
+    await expect(promise1).rejects.toMatchObject({ name: "AbortError" });
+    expect(runtime.aborted).toBe(1);
+    expect(registry.inFlightCount()).toBe(0);
+
+    // Job 2: immediate reacquire under the same key.
+    const promise2 = acquire(registry, "open:new");
+    await waitFor(() => registry.inFlightCount() === 1 && runtime.builds === 2);
+
+    // Old build #1 settles NOW (abort-ignoring resolve). It must neither
+    // evict job 2 from inFlight nor enter the completed cache.
+    runtime.gate(1);
+    // One macrotask turn: the old build's settle handlers are pure
+    // microtasks and are guaranteed to have run by then.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(registry.inFlightCount()).toBe(1); // job 2 survived the old settle
+
+    // A third consumer JOINS job 2 — never a third build.
+    const promise3 = acquire(registry, "edit:third");
+    await waitFor(() => registry.leaseCount() >= 2);
+    expect(runtime.builds).toBe(2);
+
+    runtime.gate(); // release job 2
+    const [lease2, lease3] = await Promise.all([promise2, promise3]);
+    expect(runtime.builds).toBe(2);
+    // Both hold job 2's context — never the cancelled build #1 (mtimeNs 1n).
+    expect(lease2.context.version.fingerprint.mtimeNs).toBe(2n);
+    expect(lease3.context.version.fingerprint.mtimeNs).toBe(2n);
+    lease2.release();
+    lease3.release();
+
+    // The completed cache holds job 2's context, not the cancelled one.
+    const lease4 = await acquire(registry, "preview:cachecheck");
+    expect(runtime.builds).toBe(2); // cache hit, no rebuild
+    expect(lease4.context.version.fingerprint.mtimeNs).toBe(2n);
+    lease4.release();
   });
 });

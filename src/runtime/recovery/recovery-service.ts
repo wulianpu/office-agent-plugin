@@ -12,6 +12,11 @@
  *    file — never deletes the only recoverable candidate copy.
  *  - source-unregistrable keeps the journal UNRESOLVED (recovery-blocked),
  *    never marks aborted when the physical commit already replaced the source.
+ *
+ * Round 7 (schema v3): commit idempotency is EXACT — revisions.commit_id is
+ * UNIQUE, so "this commit already landed" is identity-proven. A→B→A content
+ * returns never collide with history; every interrupted commit lands its own
+ * revision with a continuous sequence.
  */
 
 import type { RecoveryOutcome } from "../../contracts/revision.js";
@@ -121,25 +126,25 @@ export class RecoveryService {
           return { commitId: record.commitId, resolution: "conflict", reason: "journal-vanished" };
         }
 
-        // Idempotency: if this exact commit already finalized (crash AFTER
-        // the transaction), the journal shows finalized and won't appear in
-        // unresolvedJournal. If we get here, the revision may or may not
-        // exist — the atomic transaction handles both (INSERT OR IGNORE
-        // semantics via the revision PK check below).
-        const existing = this.revisions
-          .list(record.sessionId)
-          .find((r) => r.contentHash === record.candidateHash && r.origin === record.origin);
+        // v3 exact-commit idempotency: "has THIS commit landed a revision?"
+        // is decided by commit_id identity — NEVER by content hash. A→B→A
+        // same-origin commits each land their own revision; a content-hash
+        // match against history would swallow the newest revision and lose
+        // the sequence.
+        const existing = this.revisions.getRevisionByCommitId(record.commitId);
         if (!existing) {
           const revision = this.revisions.prepare({
             sessionId: record.sessionId,
             artifactRef,
             contentHash: record.candidateHash,
-            origin: record.origin as "human" | "agent" | "external"
+            origin: record.origin as "human" | "agent" | "external",
+            commitId: record.commitId
           });
           this.repos.finalizeCommitAtomically(revision, journalRecord);
         } else {
-          // Revision exists but journal never flipped → flip it now.
-          this.markPhase(record.commitId, "finalized");
+          // The revision for THIS exact commit exists but the journal never
+          // flipped (injected/legacy state) — atomic identity-proven flip.
+          this.repos.markJournalFinalized(record.commitId);
         }
 
         await this.emit(record.sessionId, {

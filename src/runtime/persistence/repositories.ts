@@ -44,6 +44,7 @@ interface RevisionRow {
   content_hash: string;
   origin: string;
   created_at: number;
+  commit_id: string | null;
 }
 
 interface CandidateRow {
@@ -204,8 +205,8 @@ export class RuntimeRepositories
   insertRevision(rev: CommittedRevision): void {
     this.db
       .prepare(
-        `INSERT INTO revisions (revision_id, session_id, sequence, artifact_ref, content_hash, origin, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO revisions (revision_id, session_id, sequence, artifact_ref, content_hash, origin, created_at, commit_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         rev.revisionId,
@@ -214,7 +215,8 @@ export class RuntimeRepositories
         rev.artifactRef,
         rev.contentHash,
         rev.origin,
-        rev.createdAt
+        rev.createdAt,
+        rev.commitId ?? null
       );
   }
 
@@ -238,6 +240,14 @@ export class RuntimeRepositories
         .prepare("SELECT * FROM revisions WHERE session_id = ? ORDER BY sequence")
         .all(sessionId) as unknown as RevisionRow[]
     ).map(revisionFromRow);
+  }
+
+  /** v3 exact-commit idempotency: identity lookup, never content-hash matching. */
+  findRevisionByCommitId(commitId: string): CommittedRevision | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM revisions WHERE commit_id = ? LIMIT 1")
+      .get(commitId) as RevisionRow | undefined;
+    return row ? revisionFromRow(row) : undefined;
   }
 
   // ---- candidates ----
@@ -391,8 +401,8 @@ export class RuntimeRepositories
     this.rtdb.withTransaction(() => {
       this.db
         .prepare(
-          `INSERT INTO revisions (revision_id, session_id, sequence, artifact_ref, content_hash, origin, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO revisions (revision_id, session_id, sequence, artifact_ref, content_hash, origin, created_at, commit_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           revision.revisionId,
@@ -401,7 +411,8 @@ export class RuntimeRepositories
           revision.artifactRef,
           revision.contentHash,
           revision.origin,
-          revision.createdAt
+          revision.createdAt,
+          revision.commitId ?? null
         );
       this.db
         .prepare(
@@ -423,6 +434,19 @@ export class RuntimeRepositories
           Date.now()
         );
     });
+  }
+
+  /**
+   * v3 exact-commit journal flip: the revision row for THIS commitId provably
+   * exists but the journal never flipped (injected/legacy state). A single
+   * atomic UPDATE — no insert, no content-hash guessing.
+   */
+  markJournalFinalized(commitId: string): void {
+    this.db
+      .prepare(
+        `UPDATE commit_journal SET phase = 'finalized', updated_at = ? WHERE commit_id = ?`
+      )
+      .run(Date.now(), commitId);
   }
 
   upsertJournal(record: CommitJournalRecord): void {
@@ -529,7 +553,8 @@ function revisionFromRow(row: RevisionRow): CommittedRevision {
     artifactRef: row.artifact_ref,
     contentHash: row.content_hash,
     origin: row.origin as RevisionOrigin,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    commitId: row.commit_id ?? undefined
   };
 }
 

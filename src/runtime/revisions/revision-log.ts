@@ -23,6 +23,8 @@ export class RevisionLog {
     artifactRef: ArtifactRef;
     contentHash: string;
     origin: RevisionOrigin;
+    /** v3: exact commit identity — REQUIRED for journal-backed commits. */
+    commitId?: string;
   }): CommittedRevision {
     return {
       revisionId: newRevisionId(),
@@ -31,7 +33,8 @@ export class RevisionLog {
       artifactRef: params.artifactRef,
       contentHash: params.contentHash,
       origin: params.origin,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      commitId: params.commitId
     };
   }
 
@@ -40,6 +43,7 @@ export class RevisionLog {
     artifactRef: ArtifactRef;
     contentHash: string;
     origin: RevisionOrigin;
+    commitId?: string;
   }): CommittedRevision {
     const revision: CommittedRevision = {
       revisionId: newRevisionId(),
@@ -48,7 +52,8 @@ export class RevisionLog {
       artifactRef: params.artifactRef,
       contentHash: params.contentHash,
       origin: params.origin,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      commitId: params.commitId
     };
     this.repos.insertRevision(revision);
     return revision;
@@ -64,5 +69,10 @@ export class RevisionLog {
 
   get(revisionId: string): CommittedRevision | undefined {
     return this.repos.getRevision(revisionId);
+  }
+
+  /** v3: exact-commit lookup — recovery idempotency by identity, not hash. */
+  getRevisionByCommitId(commitId: string): CommittedRevision | undefined {
+    return this.repos.findRevisionByCommitId(commitId);
   }
 }

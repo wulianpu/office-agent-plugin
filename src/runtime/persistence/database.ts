@@ -8,7 +8,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export class RuntimeDatabase {
   readonly db: DatabaseSync;
@@ -157,6 +157,16 @@ export class RuntimeDatabase {
           created_at INTEGER NOT NULL,
           PRIMARY KEY (candidate_id, idempotency_key)
         );
+      `);
+    }
+    if (version === 3) {
+      // v3 (§76 exact-commit idempotency): revisions carry the commit_id of
+      // the journal row that produced them. UNIQUE (NULLs allowed for legacy
+      // rows and journal-less external revisions) — recovery decides "has
+      // this commit landed?" by exact identity, never by content hash.
+      this.db.exec(`
+        ALTER TABLE revisions ADD COLUMN commit_id TEXT;
+        CREATE UNIQUE INDEX idx_revisions_commit_id ON revisions(commit_id);
       `);
     }
   }

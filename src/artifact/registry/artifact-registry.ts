@@ -77,19 +77,26 @@ export class ArtifactRegistry implements IArtifactRegistry {
     let job = this.inFlight.get(key);
     if (!job) {
       const abort = new AbortController();
+      // P1-high (round 7): settle handlers are IDENTITY-GUARDED. After a
+      // cancelled build is removed, a new job may already occupy this key —
+      // an unguarded delete here would evict the NEW in-flight job (ABA),
+      // and a cancelled resolve must never poison the completed cache.
+      const self = this;
       const built: Promise<ArtifactContext> = runtime
         .createArtifactContext({
           ...input,
           profile,
           signal: abort.signal
         })
-        .then((context) => {
-          this.completed.set(key, context);
-          this.inFlight.delete(key);
+        .then(function landed(context) {
+          const owner = self.inFlight.get(key);
+          if (!job!.cancelled) self.completed.set(key, context);
+          if (owner === job!) self.inFlight.delete(key);
           return context;
         })
-        .catch((error) => {
-          this.inFlight.delete(key);
+        .catch((error: unknown) => {
+          const owner = self.inFlight.get(key);
+          if (owner === job!) self.inFlight.delete(key);
           throw error;
         });
       job = { key, consumers: new Set(), abort, promise: built, cancelled: false };

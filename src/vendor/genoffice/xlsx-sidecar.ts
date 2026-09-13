@@ -71,6 +71,14 @@ export class XlsxSidecarClient {
       if (this.startError) throw this.startError;
       return;
     }
+    // Fast-fail before spawning: a missing binary must reject the FIRST
+    // request immediately — spawn() reports ENOENT asynchronously via the
+    // 'error' event, and an unobserved one leaves every pending request
+    // unsettled forever (the CI integration red build hung exactly there).
+    if (!existsSync(this.exePath)) {
+      this.startError = new Error(`xlsx sidecar binary not found: ${this.exePath}`);
+      throw this.startError;
+    }
     try {
       this.child = spawn(this.exePath, [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true }) as ChildProcessWithoutNullStreams;
       const rl = createInterface({ input: this.child.stdout! });
@@ -86,6 +94,14 @@ export class XlsxSidecarClient {
         } catch {
           // Ignore malformed lines (engine stderr diagnostics stay on stderr).
         }
+      });
+      this.child.on("error", (error) => {
+        // Spawn/early-lifecycle failure: settle every pending request NOW and
+        // latch the error so later calls fail fast instead of hanging.
+        this.startError = error instanceof Error ? error : new Error(String(error));
+        for (const [, entry] of this.pending) entry.reject(this.startError);
+        this.pending.clear();
+        this.child = undefined;
       });
       this.child.on("exit", () => {
         for (const [, entry] of this.pending) entry.reject(new Error("sidecar exited"));
@@ -135,7 +151,8 @@ export class XlsxSidecarClient {
 
 /**
  * Bounded preview window through the sidecar (§30 read path letter):
- * open → first sheet viewport → close. Returns undefined when unavailable.
+ * open → first sheet viewport → close. Rejects when the sidecar is
+ * unavailable — callers fall back to the in-process renderer.
  */
 export async function sidecarPreviewWindow(
   client: XlsxSidecarClient,

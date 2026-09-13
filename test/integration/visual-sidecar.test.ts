@@ -16,7 +16,7 @@ let fixture: Awaited<ReturnType<typeof createOfficeCliFixture>>;
 /** CI without the OfficeCLI engine: the whole suite skips cleanly. */
 const engineUp = await import("../../src/agent/officecli/officecli-adapter.js")
   .then(async (m) => {
-    const probe = new m.OfficeCliAdapter();
+    const probe = new m.OfficeCliAdapter({ timeoutMs: 5_000 }); // probe skips in seconds — never the 120s default
     return probe.version_().then(() => true).catch(() => false);
   })
   .catch(() => false);

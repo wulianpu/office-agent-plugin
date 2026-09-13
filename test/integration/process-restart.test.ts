@@ -113,6 +113,25 @@ if (mode === "committed") {
     updatedAt: Date.now()
   });
   console.log(JSON.stringify({ ref, revisionId: null, mode, candidateHash }));
+} else if (mode === "kill-temp-ready" || mode === "kill-source-replaced") {
+  // REAL commit-phase kill (§141 release gate): run a genuine agent commit
+  // and abort the process AT the journal phase boundary — no fabricated
+  // journal rows, the committer itself wrote the state we recover from.
+  const killPhase = mode === "kill-temp-ready" ? "temp-ready" : "source-replaced";
+  plugin.service.committer.faultHook = (phase) => {
+    if (phase === killPhase) process.abort();
+  };
+  const task = await plugin.beginAgentTask(session.sessionId, { intent: "kill-commit", destructiveAllowed: false });
+  await plugin.executeAgentMutation(task, {
+    commandId: "cmd-kill",
+    idempotencyKey: "kill-1",
+    payload: [{ command: "set", path: "/body/paragraph[1]", props: { text: "Killed At Boundary" } }]
+  });
+  await plugin.flushAgentCandidate(task);
+  await plugin.verifyAgentCandidate(task);
+  await plugin.finalizeAgentTask(task); // release the writer lease before accept
+  await plugin.acceptCandidate(session.sessionId);
+  console.log(JSON.stringify({ ref, mode, completed: true })); // unreachable: abort fires first
 }
 
 await plugin.dispose();
@@ -141,16 +160,17 @@ for (const a of artifacts.filter(x => x.kind === "source")) {
   }
 }
 
-const journal = plugin.service.repos.listJournal();
-const revisions = plugin.service.repos.listJournal().map(j => ({
+const journal = plugin.service.repos.listJournal().map(j => ({
   commitId: j.commitId,
-  phase: j.phase
+  phase: j.phase,
+  // v3 identity binding: the revision THIS commit landed (exact commit_id).
+  revisionId: (plugin.service.revisions.getRevisionByCommitId(j.commitId) || {}).revisionId ?? null
 }));
 
 console.log(JSON.stringify({
   recovery,
   refResults,
-  journal: revisions,
+  journal,
   artifactCount: artifacts.length
 }));
 
@@ -158,7 +178,11 @@ await plugin.dispose();
 process.exit(0);
 `;
 
-async function runPhase(script: string, ...args: string[]): Promise<Record<string, unknown>> {
+async function runPhase(
+  script: string,
+  args: string[],
+  options?: { expectCrash?: boolean }
+): Promise<Record<string, unknown>> {
   const scriptPath = join(workspace, `phase-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
   await writeFile(scriptPath, script, "utf8");
   try {
@@ -169,15 +193,22 @@ async function runPhase(script: string, ...args: string[]): Promise<Record<strin
     });
     const jsonLine = stdout.trim().split("\n").find((l) => l.startsWith("{"));
     return JSON.parse(jsonLine ?? "{}");
+  } catch (error) {
+    // Fault-injection phases kill the child on purpose — that IS the crash
+    // under test, not a runner failure.
+    if (options?.expectCrash) return { crashed: true };
+    throw error;
   } finally {
     await rm(scriptPath, { force: true }).catch(() => undefined);
   }
 }
 
-/** CI without the OfficeCLI engine: the child processes need it for fixtures. */
+/** CI without the OfficeCLI engine: the child processes need it for fixtures.
+ *  The probe uses a hard 5s timeout — a wedged PATH/shim must skip in
+ *  seconds, never eat the adapter's 120s default. */
 const engineAvailable = await import("../../src/agent/officecli/officecli-adapter.js")
   .then(async (m) => {
-    const probe = new m.OfficeCliAdapter();
+    const probe = new m.OfficeCliAdapter({ timeoutMs: 5_000 });
     return probe.version_().then(() => true).catch(() => false);
   })
   .catch(() => false);
@@ -186,12 +217,12 @@ describe.skipIf(!engineAvailable)("process-restart recovery (§77)", () => {
   it("committed state: restart resolves all refs and revisions intact", async () => {
     const dir = join(workspace, "committed");
     await mkdir(dir, { recursive: true });
-    const phase1 = await runPhase(PHASE1_SCRIPT, dir, "committed");
+    const phase1 = await runPhase(PHASE1_SCRIPT, [dir, "committed"]);
 
     expect(phase1.ref).toBeTruthy();
     expect(phase1.revisionId).toBeTruthy();
 
-    const phase2 = await runPhase(PHASE2_SCRIPT, dir);
+    const phase2 = await runPhase(PHASE2_SCRIPT, [dir]);
 
     // ArtifactRef resolves (P0-1 hydration test)
     const sourceRef = (phase2.refResults as Array<{ ref: string; resolved: boolean }>).find(
@@ -210,9 +241,9 @@ describe.skipIf(!engineAvailable)("process-restart recovery (§77)", () => {
   it("PREPARED crash: restart recovers → rolled back, ref resolvable", async () => {
     const dir = join(workspace, "prepared");
     await mkdir(dir, { recursive: true });
-    await runPhase(PHASE1_SCRIPT, dir, "crash-prepared");
+    await runPhase(PHASE1_SCRIPT, [dir, "crash-prepared"]);
 
-    const phase2 = await runPhase(PHASE2_SCRIPT, dir);
+    const phase2 = await runPhase(PHASE2_SCRIPT, [dir]);
 
     const prep = (phase2.journal as Array<{ commitId: string; phase: string }>).find(
       (j) => j.commitId === "cmt_crash_prep"
@@ -227,9 +258,9 @@ describe.skipIf(!engineAvailable)("process-restart recovery (§77)", () => {
   it("SOURCE_REPLACED crash: restart forward-recovers revision", async () => {
     const dir = join(workspace, "source-replaced");
     await mkdir(dir, { recursive: true });
-    const phase1 = await runPhase(PHASE1_SCRIPT, dir, "crash-source-replaced");
+    const phase1 = await runPhase(PHASE1_SCRIPT, [dir, "crash-source-replaced"]);
 
-    const phase2 = await runPhase(PHASE2_SCRIPT, dir);
+    const phase2 = await runPhase(PHASE2_SCRIPT, [dir]);
 
     const sr = (phase2.journal as Array<{ commitId: string; phase: string }>).find(
       (j) => j.commitId === "cmt_crash_sr"
@@ -239,5 +270,33 @@ describe.skipIf(!engineAvailable)("process-restart recovery (§77)", () => {
     // Refs resolve
     const resolved = (phase2.refResults as Array<{ resolved: boolean }>).filter((r) => r.resolved);
     expect(resolved.length).toBeGreaterThan(0);
+  }, 300_000);
+
+  it("REAL kill at TEMP_READY boundary: restart rolls the commit back (§141 fault injection)", async () => {
+    const dir = join(workspace, "kill-temp-ready");
+    await mkdir(dir, { recursive: true });
+    const phase1 = await runPhase(PHASE1_SCRIPT, [dir, "kill-temp-ready"], { expectCrash: true });
+    expect(phase1.crashed).toBe(true); // process.abort() fired inside the real committer
+
+    const phase2 = await runPhase(PHASE2_SCRIPT, [dir]);
+
+    const journal = phase2.journal as Array<{ commitId: string; phase: string; revisionId: string | null }>;
+    expect(journal).toHaveLength(1); // exactly the killed commit
+    expect(journal[0]!.phase).toBe("aborted"); // source untouched → rollback
+    expect(journal[0]!.revisionId).toBeNull(); // rolled back → no revision ever landed
+  }, 300_000);
+
+  it("REAL kill at SOURCE_REPLACED boundary: restart forward-finalizes with identity-bound revision", async () => {
+    const dir = join(workspace, "kill-source-replaced");
+    await mkdir(dir, { recursive: true });
+    const phase1 = await runPhase(PHASE1_SCRIPT, [dir, "kill-source-replaced"], { expectCrash: true });
+    expect(phase1.crashed).toBe(true);
+
+    const phase2 = await runPhase(PHASE2_SCRIPT, [dir]);
+
+    const journal = phase2.journal as Array<{ commitId: string; phase: string; revisionId: string | null }>;
+    expect(journal).toHaveLength(1);
+    expect(journal[0]!.phase).toBe("finalized"); // source holds candidate → forward finalize
+    expect(journal[0]!.revisionId).toBeTruthy(); // exactly one revision, bound by commit_id (v3)
   }, 300_000);
 });

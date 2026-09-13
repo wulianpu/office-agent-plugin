@@ -16,6 +16,13 @@ export interface CommittedRevision {
   contentHash: string;
   origin: RevisionOrigin;
   createdAt: number;
+  /**
+   * Exact commit identity (schema v3): set for every revision landed through
+   * the atomic committer or forward-recovery. UNIQUE in SQLite — a commit can
+   * land at most one revision regardless of content hash. Null only for
+   * legacy rows and journal-less external revisions.
+   */
+  commitId?: string;
 }
 
 export type RevisionOrigin = "human" | "agent" | "external";

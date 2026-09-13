@@ -130,8 +130,16 @@ export class SessionManager {
           return stableHashFile(sourcePath, { signal: cancelController.signal });
         }
       });
-      // Real cancellation: abort signal reaches sha256File's chunk loop.
-      this.hashCancellers.set(sessionId, () => cancelController.abort());
+      // Real cancellation on BOTH states of the job: queued → hashHandle.cancel()
+      // dequeues it (it would otherwise sit in the scheduler queue until
+      // dispatched, occupying queue/backpressure and briefly acquiring IO);
+      // running → the AbortController stops sha256File's chunk loop (the
+      // scheduler cancel only fires the scheduler-level signal, which the
+      // hash job deliberately ignores in favor of its own controller).
+      this.hashCancellers.set(sessionId, () => {
+        hashHandle.cancel();
+        cancelController.abort();
+      });
       const stable = await hashHandle.promise;
       if (!stable) {
         // File keeps moving under us — surface as a conflict, not a bad hash.

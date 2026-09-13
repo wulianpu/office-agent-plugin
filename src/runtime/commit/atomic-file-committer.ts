@@ -36,6 +36,12 @@ export interface CommitPathsRequest {
 export class AtomicFileCommitter {
   /** Optional lock releaser invoked when Windows rename hits EPERM/EBUSY. */
   lockReleaser?: (path: string) => Promise<void>;
+  /**
+   * §141 fault injection (test-only): invoked after each journal phase lands.
+   * A hook that kills the process here reproduces a REAL crash at a commit
+   * phase boundary (stronger than fabricating journal rows by hand).
+   */
+  faultHook?: (phase: CommitPhase, commitId: string) => void;
 
   constructor(
     private readonly repos: RuntimeRepositories,
@@ -138,12 +144,14 @@ export class AtomicFileCommitter {
 
     // P0-A: build the revision, then land revision-insert + journal
     // FINALIZED in ONE transaction (see finalizeCommitAtomically). The
-    // durable event fires only after both facts are on disk.
+    // revision carries this commit's identity (v3) — recovery decides
+    // "already landed?" by exact commit_id, never by content hash.
     const revision = this.revisions.prepare({
       sessionId: request.sessionId,
       artifactRef: request.sessionArtifactRef,
       contentHash: replacedHash,
-      origin: request.origin
+      origin: request.origin,
+      commitId
     });
     this.repos.finalizeCommitAtomically(revision, record);
 
@@ -166,6 +174,9 @@ export class AtomicFileCommitter {
   private async journal(record: CommitJournalRecord, phase: CommitPhase): Promise<void> {
     const updated = { ...record, phase, updatedAt: Date.now() };
     this.repos.upsertJournal(updated);
+    // §141: fire AFTER the phase is durable — a hook that kills the process
+    // here leaves the journal exactly at this phase boundary.
+    this.faultHook?.(phase, record.commitId);
     await this.events
       .emit(record.sessionId, 0, "commit.journal-updated", { commitId: record.commitId, phase })
       .catch(() => undefined);

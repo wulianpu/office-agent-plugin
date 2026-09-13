@@ -110,7 +110,12 @@ describe("concurrent commit safety (P11, INV-10/11)", () => {
     await ws.plugin.closeSession(sessionB.sessionId);
   });
 
-  it("serialized accepts on the same source file: exactly one wins", async () => {
+  // Engine-dependent: agent mutations + verification spawn OfficeCLI — a
+  // runner without the engine must skip (spawn ENOENT), not fail. Runtime
+  // skip: `it.skipIf` is evaluated at collection time, before beforeAll
+  // assigns the fixture probe.
+  it("serialized accepts on the same source file: exactly one wins", async (ctx) => {
+    if (!fixture.available) ctx.skip();
     const ref = await ws.plugin.registerArtifact(docxPath);
     const sessionA = await ws.plugin.openSession(ref);
     const sessionB = await ws.plugin.openSession(ref);

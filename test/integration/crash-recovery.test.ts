@@ -127,6 +127,95 @@ describe("Crash recovery (§77, §141, INV-15)", () => {
     expect(await sha256File(docxPath)).toBe(sha256Buffer(thirdParty));
   });
 
+  it("A→B→A same-origin: recovery lands a NEW revision, sequence continuous (v3 exact idempotency)", async () => {
+    await restorePristine();
+    const sessionId = "sess_aba";
+    const contentA = pristine;
+    const contentB = Buffer.concat([pristine, Buffer.from("B")]);
+    const { sha256Buffer } = await import("../../src/support/fsx.js");
+    const hashA = sha256Buffer(contentA);
+    const hashB = sha256Buffer(contentB);
+    const now = Date.now();
+    // History: A(agent) → B(agent). Latest revision is B.
+    ws.plugin.service.repos.insertRevision({
+      revisionId: "rev_aba_a", sessionId, sequence: 1, artifactRef: "art_src_aba",
+      contentHash: hashA, origin: "agent", createdAt: now
+    });
+    ws.plugin.service.repos.insertRevision({
+      revisionId: "rev_aba_b", sessionId, sequence: 2, artifactRef: "art_src_aba",
+      contentHash: hashB, origin: "agent", createdAt: now
+    });
+
+    // A third agent commit crashes at SOURCE_REPLACED; its content is A again.
+    // Content-hash matching against history would swallow this revision.
+    const commitId = "cmt_aba_return";
+    await writeFile(docxPath, contentA);
+    await writeFile(`${docxPath}.commit-${commitId}`, contentA);
+    ws.plugin.service.repos.upsertJournal({
+      commitId,
+      sessionId,
+      candidateId: "cand_aba",
+      sourcePath: docxPath,
+      tempPath: `${docxPath}.commit-${commitId}`,
+      sourceHashBefore: hashB, // the commit was based on B
+      candidateHash: hashA,    // the new content returns to A
+      phase: "source-replaced",
+      origin: "agent",
+      createdAt: now,
+      updatedAt: now
+    });
+
+    await ws.plugin.dispose();
+    ws.plugin = await OfficePlugin.create({ workspaceRoot: join(ws.root, "runtime"), engineDisabled: true });
+
+    expect(ws.plugin.service.repos.getJournal(commitId)!.phase).toBe("finalized");
+    const revisions = ws.plugin.service.repos.listRevisions(sessionId);
+    expect(revisions).toHaveLength(3); // a NEW third revision, not a history match
+    expect(revisions[2]!.contentHash).toBe(hashA);
+    expect(revisions[2]!.sequence).toBe(3); // sequence stays continuous
+    expect(revisions[2]!.commitId).toBe(commitId); // bound by exact identity
+    expect(revisions[2]!.revisionId).not.toBe("rev_aba_a");
+  });
+
+  it("revision exists but journal never flipped → identity-proven flip, no duplicate revision", async () => {
+    await restorePristine();
+    const sessionId = "sess_flip";
+    const commitId = "cmt_flip_legacy";
+    const { sha256Buffer } = await import("../../src/support/fsx.js");
+    const candidate = Buffer.concat([pristine, Buffer.from([0x44])]);
+    const candidateHash = sha256Buffer(candidate);
+    await writeFile(docxPath, candidate);
+
+    // Injected state: the revision for THIS commit already landed (v3
+    // commit_id bound)… anything else in history is irrelevant.
+    ws.plugin.service.repos.insertRevision({
+      revisionId: "rev_flip", sessionId, sequence: 1, artifactRef: "art_flip",
+      contentHash: candidateHash, origin: "agent", createdAt: Date.now(), commitId
+    });
+    // …but the journal is still at SOURCE_REPLACED.
+    ws.plugin.service.repos.upsertJournal({
+      commitId,
+      sessionId,
+      candidateId: "cand_flip",
+      sourcePath: docxPath,
+      tempPath: `${docxPath}.commit-${commitId}`,
+      sourceHashBefore: sha256Buffer(pristine),
+      candidateHash,
+      phase: "source-replaced",
+      origin: "agent",
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+
+    await ws.plugin.dispose();
+    ws.plugin = await OfficePlugin.create({ workspaceRoot: join(ws.root, "runtime"), engineDisabled: true });
+
+    expect(ws.plugin.service.repos.getJournal(commitId)!.phase).toBe("finalized");
+    const revisions = ws.plugin.service.repos.listRevisions(sessionId);
+    expect(revisions).toHaveLength(1); // flipped in place — no duplicate insert
+    expect(revisions[0]!.revisionId).toBe("rev_flip");
+  });
+
   it("SelfWriteGuard recognizes self-originated watcher events (§73)", async () => {
     await restorePristine();
     const guards = ws.plugin.service.selfWrites;
