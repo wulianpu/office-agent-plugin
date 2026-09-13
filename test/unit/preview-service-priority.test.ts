@@ -236,6 +236,212 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     expect(entries.filter((p) => p === aPath)).toHaveLength(1);
   });
 
+  it("consumer-aware cancellation: one joiner aborting never kills the other's shared work (round 10 reopen)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "ab-cancel.xlsx");
+    await writeFile(path, Buffer.alloc(24, 7));
+    registry.setPathResolver(() => path);
+
+    let releaseSidecar!: () => void;
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => {
+          await new Promise<void>((resolve) => (releaseSidecar = resolve));
+          return [{ name: "Sheet1", window: [["ok"]], rowCount: 1 }];
+        }
+      }
+    );
+
+    let releaseBlocker!: () => void;
+    const blocker = scheduler.submit({
+      label: "blocker",
+      priority: "INTERACTIVE",
+      run: () => new Promise<void>((resolve) => (releaseBlocker = resolve))
+    });
+    void blocker.promise.catch(() => undefined);
+    await waitFor(() => scheduler.runningCount === 1);
+
+    const controllerA = new AbortController();
+    // A and B share one artifact + scope -> one shared render.
+    const a = service.preview({ requestId: "a", artifactRef: "art-ab", priority: "background", signal: controllerA.signal });
+    void a.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 1);
+    const b = service.preview({ requestId: "b", artifactRef: "art-ab", priority: "background" });
+    await new Promise((resolve) => setTimeout(resolve, 25)); // B joins the shared entry
+
+    controllerA.abort(); // A detaches — B must survive
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(1); // shared queued work NOT cancelled
+
+    releaseBlocker();
+    await waitFor(() => scheduler.queueDepth === 0);
+    releaseSidecar();
+    const modelB = await b; // B succeeds on the shared render
+    expect(modelB.model.outline.kind).toBe("xlsx");
+    await a.catch(() => undefined);
+  });
+
+  it("consumer-aware cancellation: when BOTH consumers abort, the queued shared work dequeues (round 10 reopen)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "ab-both.xlsx");
+    await writeFile(path, Buffer.alloc(24, 8));
+    registry.setPathResolver(() => path);
+    let entered = 0;
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => {
+          entered++;
+          return [{ name: "Sheet1", window: [["x"]], rowCount: 1 }];
+        }
+      }
+    );
+
+    const blocker = scheduler.submit({ label: "blocker", priority: "INTERACTIVE", run: () => new Promise<void>(() => undefined) });
+    void blocker.promise.catch(() => undefined);
+    await waitFor(() => scheduler.runningCount === 1);
+
+    const ca = new AbortController();
+    const cb = new AbortController();
+    const a = service.preview({ requestId: "a2", artifactRef: "art-both", priority: "background", signal: ca.signal });
+    const b = service.preview({ requestId: "b2", artifactRef: "art-both", priority: "background", signal: cb.signal });
+    void a.catch(() => undefined);
+    void b.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 1);
+    await new Promise((resolve) => setTimeout(resolve, 25)); // both joined
+
+    ca.abort();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(1); // B still alive
+    cb.abort(); // last consumer leaves
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(0); // shared work dequeued
+    blocker.cancel();
+    expect(entered).toBe(0); // never reached the native port
+  });
+
+  it("priority inheritance survives joins made BEFORE any render handle exists (round 10 reopen)", async () => {
+    // The shared render is still inside registry.acquire (full build queued,
+    // gated) when the VISIBLE joiner arrives — no scheduler handles exist
+    // yet. The joiner's own registry.acquire must promote the queued build.
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    const runtime = {
+      format: "xlsx" as const,
+      builds: [] as string[],
+      gates: [] as Array<() => void>,
+      async createArtifactContext(input: { artifactRef: string; consistency: "optimistic" | "stable" }) {
+        runtime.builds.push(input.artifactRef);
+        await new Promise<void>((resolve) => runtime.gates.push(resolve));
+        return {
+          artifactRef: input.artifactRef,
+          version: { artifactRef: input.artifactRef, fingerprint: { size: 1n, mtimeNs: 1n } },
+          format: "xlsx" as const,
+          consistency: input.consistency,
+          rendererVersion: "test",
+          lastAccessAt: Date.now(),
+          enrichment: new Map()
+        };
+      },
+      initialize: async () => undefined,
+      trimMemory: async () => undefined,
+      dispose: async () => undefined
+    };
+    registry.registerRuntime(runtime, "full");
+    registry.setBuildScheduler(scheduler);
+    const pathA = join(dir, "pre-handle-a.xlsx");
+    const pathB = join(dir, "pre-handle-b.xlsx");
+    await writeFile(pathA, Buffer.alloc(24, 1));
+    await writeFile(pathB, Buffer.alloc(24, 2));
+    registry.setPathResolver((ref: string) => (ref === "art-pa" ? pathA : pathB));
+    const service = new PreviewService(
+      {
+        formatOf: () => "xlsx",
+        resolvePath: (ref: string) => (ref === "art-pa" ? pathA : pathB)
+      } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      undefined // no sidecar: build queued, then the fallback render path
+    );
+
+    let releaseBlocker!: () => void;
+    const blocker = scheduler.submit({
+      label: "blocker",
+      priority: "INTERACTIVE",
+      run: () => new Promise<void>((resolve) => (releaseBlocker = resolve))
+    });
+    void blocker.promise.catch(() => undefined);
+    await waitFor(() => scheduler.runningCount === 1);
+
+    // BACKGROUND visual build for A queues (full profile, gated runtime).
+    const backgroundA = service.preview({ requestId: "pa", artifactRef: "art-pa", priority: "background", visual: true });
+    void backgroundA.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 1); // A's BUILD queued — no render handles yet
+    // A second background build for B queues AFTER the join.
+    const backgroundB = service.preview({ requestId: "pb", artifactRef: "art-pb", priority: "background", visual: true });
+    void backgroundB.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 2);
+    // VISIBLE joins A while its build is still queued.
+    const visibleA = service.preview({ requestId: "pv", artifactRef: "art-pa", priority: "visible", visual: true });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    releaseBlocker();
+    // The promoted build for A must dispatch before B's BACKGROUND build.
+    await waitFor(() => runtime.builds.length >= 1);
+    expect(runtime.builds[0]).toBe("art-pa");
+    while (runtime.builds.length < 2) {
+      runtime.gates.splice(0)[0]?.();
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(runtime.builds[1]).toBe("art-pb");
+    for (let i = 0; i < 4; i++) runtime.gates.splice(0)[0]?.();
+    await Promise.allSettled([backgroundA, backgroundB, visibleA]);
+    // Still ONE parse for artifact A (dedup preserved through the join).
+    expect(runtime.builds.filter((ref) => ref === "art-pa")).toHaveLength(1);
+  });
+
+  it("the full 1-based range (origin + extent) is forwarded to the sidecar port (round 10 reopen)", async () => {
+    const scheduler = new Scheduler();
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "range-fwd.xlsx");
+    await writeFile(path, Buffer.alloc(24, 4));
+    registry.setPathResolver(() => path);
+    const received: Array<Record<string, unknown>> = [];
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async (_p: string, options?: Record<string, unknown>) => {
+          received.push(options ?? {});
+          return [{ name: "Data", window: [["v"]], rowCount: 42 }];
+        }
+      }
+    );
+    const result = await service.preview({
+      requestId: "range-1",
+      artifactRef: "art-range",
+      priority: "visible",
+      scope: { location: { sheet: "Data", range: { fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 } } }
+    });
+    if (result.model.outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(received[0]!.range).toEqual({ fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 });
+    expect(received[0]!.sheet).toBe("Data");
+    // rowCountExact honors real metadata only.
+    expect(result.model.outline.sheets[0]!.rowCountExact).toBe(true);
+  });
+
   it("consumer abort dequeues a queued sidecar preview before it reaches the native process (round 10)", async () => {
     const scheduler = new Scheduler({ maxConcurrent: 1 });
     const registry = new ArtifactRegistry();

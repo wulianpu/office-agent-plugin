@@ -124,6 +124,13 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   const maxCols = range ? Math.min(XLSX_MAX_COLS, range.toCol - range.fromCol + 1) : XLSX_MAX_COLS;
   const fromRow = range ? Math.max(1, range.fromRow) : 1;
   const fromCol = range ? Math.max(1, range.fromCol) : 1;
+  // An explicit range is a HARD row boundary: maxEntries may narrow it but
+  // never extend the window past toRow.
+  const toRow = range ? Math.max(fromRow, range.toRow) : Number.POSITIVE_INFINITY;
+  // A scoped range may start beyond the default 24-column parse cap (e.g.
+  // AA10:AC20) — parse wide enough to cover the requested window, still
+  // bounded by an absolute ceiling.
+  const colParseCap = range ? Math.min(256, fromCol - 1 + maxCols) : XLSX_MAX_COLS;
 
   const ordered = wantedSheet
     ? [...(sheetTags.find((t) => t.name === wantedSheet) ? [sheetTags.find((t) => t.name === wantedSheet)!] : []), ...sheetTags.filter((t) => t.name !== wantedSheet)]
@@ -148,6 +155,7 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
     if (index.entryByName.has(part)) {
       const carry = { pending: "" };
       let dimensionScan = "";
+      let hardStop = false;
       for await (const chunk of streamZipEntry(path, index, part)) {
         if (declaredRows === undefined && dimensionScan.length < 16 * 1024) {
           dimensionScan += chunk.toString("utf8");
@@ -158,11 +166,16 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
           rowCount++;
           const rowNumber = row.match(/<(?:[\w.-]+:)?row\b[^>]*\br="(\d+)"/)?.[1];
           const absolute = rowNumber ? Number(rowNumber) : rowCount;
+          if (absolute > toRow) {
+            hardStop = true; // explicit range boundary reached
+            break;
+          }
           if (absolute >= fromRow && window.length < maxRows) {
-            window.push(windowRow(parseRowCells(row, shared), fromCol, maxCols));
+            window.push(windowRow(parseRowCells(row, shared, colParseCap), fromCol, maxCols));
           }
           if (rowCount > 500_000) break; // row-count probe cap
         }
+        if (hardStop) break;
         if (window.length >= maxRows && rowCount > maxRows * 4) break;
       }
     }
@@ -180,12 +193,14 @@ function windowRow(cells: string[], fromCol: number, maxCols: number): string[] 
   return cells.slice(fromCol - 1, fromCol - 1 + maxCols);
 }
 
-function parseRowCells(rowXml: string, shared: string[]): string[] {
+function parseRowCells(rowXml: string, shared: string[], colCap: number = XLSX_MAX_COLS): string[] {
   const cells: string[] = [];
   // Namespace-tolerant cell matchers: engine sheets use <x:c>/<x:v>/<x:is>.
   // The open-tag alternative requires a non-`/` before `>` so a self-closed
   // cell can never swallow the NEXT cell's content up to its close tag —
   // that misparse chained the follower's value into blank cells (round 8).
+  // colCap widens only for scoped ranges whose origin lies beyond the
+  // default 24-column window (round 10).
   const cellRe =
     /<(?:[\w.-]+:)?c ([^>]*[^/>])>[\s\S]*?<\/(?:[\w.-]+:)?c>|<(?:[\w.-]+:)?c ([^>]*?)\/>/g;
   for (const m of rowXml.matchAll(cellRe)) {
@@ -210,9 +225,9 @@ function parseRowCells(rowXml: string, shared: string[]): string[] {
       if (inline) value = concatenatedTagTexts(inline[0], "t");
     }
     const colIndex = ref ? columnToIndex(ref) : cells.length;
-    while (cells.length < colIndex && cells.length < XLSX_MAX_COLS) cells.push("");
-    if (cells.length < XLSX_MAX_COLS) cells.push(value);
-    if (cells.length >= XLSX_MAX_COLS) break;
+    while (cells.length < colIndex && cells.length < colCap) cells.push("");
+    if (cells.length < colCap) cells.push(value);
+    if (cells.length >= colCap) break;
   }
   return cells;
 }

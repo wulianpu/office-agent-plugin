@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { XlsxSidecarClient } from "../../src/vendor/genoffice/xlsx-sidecar.js";
+import { XlsxSidecarClient, sidecarPreviewWindow } from "../../src/vendor/genoffice/xlsx-sidecar.js";
 
 class FakeChild extends EventEmitter {
   readonly stdout = new PassThrough();
@@ -62,6 +62,45 @@ function makeClient(options?: { requestTimeoutMs?: number; unhealthyCooldownMs?:
   const client = new TestClient(process.execPath, options);
   return { client, child };
 }
+
+describe("sidecarPreviewWindow range origin (round 10 reopen)", () => {
+  it("forwards the 1-based range as native 0-based read coordinates", async () => {
+    const ranges: Array<Record<string, number>> = [];
+    const fake = {
+      open: async () => ({
+        sessionId: "s",
+        sheets: [{ id: "sh1", name: "Data", rowCount: 500, columnCount: 60 }]
+      }),
+      readRange: async (_s: string, _id: string, range: Record<string, number>) => {
+        ranges.push(range);
+        return { cells: [] };
+      },
+      close: async () => undefined
+    } as unknown as XlsxSidecarClient;
+    await sidecarPreviewWindow(fake, "book.xlsx", {
+      sheet: "Data",
+      range: { fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 },
+      maxRows: 21,
+      maxCols: 3
+    });
+    // D10 (1-based) is native (row 9, col 3); the window spans 21x3.
+    expect(ranges[0]).toEqual({ startRow: 9, endRow: 29, startColumn: 3, endColumn: 5 });
+  });
+
+  it("default window still reads from the origin (0,0)", async () => {
+    const ranges: Array<Record<string, number>> = [];
+    const fake = {
+      open: async () => ({ sessionId: "s", sheets: [{ id: "sh1", name: "S", rowCount: 50 }] }),
+      readRange: async (_s: string, _id: string, range: Record<string, number>) => {
+        ranges.push(range);
+        return { cells: [] };
+      },
+      close: async () => undefined
+    } as unknown as XlsxSidecarClient;
+    await sidecarPreviewWindow(fake, "book.xlsx", { maxRows: 5, maxCols: 4 });
+    expect(ranges[0]).toEqual({ startRow: 0, endRow: 4, startColumn: 0, endColumn: 3 });
+  });
+});
 
 describe("XlsxSidecarClient liveness (round 9, issue #3)", () => {
   it("dispatches a matching stdout line and clears pending", async () => {

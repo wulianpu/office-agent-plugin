@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildZip } from "../helpers/zip-builder.js";
 import { renderPptxOutline, renderXlsxOutline } from "../../src/preview/outline-renderers.js";
-import { PreviewService, normalizeScopeKey } from "../../src/preview/preview-service.js";
+import { PreviewService, normalizeScopeKey, svgWindowOf } from "../../src/preview/preview-service.js";
 import { ArtifactRegistry } from "../../src/artifact/registry/artifact-registry.js";
 import { Scheduler } from "../../src/runtime/scheduler/scheduler.js";
 import type { ArtifactStore } from "../../src/artifact/store/artifact-store.js";
@@ -55,6 +55,17 @@ async function writeTwoSheetWorkbook(name: string, withDimension?: string): Prom
   return path;
 }
 
+async function writeRawSheetWorkbook(name: string, sheetDataXml: string): Promise<string> {
+  const zip = buildZip([
+    { name: "xl/workbook.xml", data: `<?xml version="1.0"?><workbook><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>` },
+    { name: "xl/_rels/workbook.xml.rels", data: `<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>` },
+    { name: "xl/worksheets/sheet1.xml", data: `<?xml version="1.0"?><worksheet><sheetData>${sheetDataXml}</sheetData></worksheet>` }
+  ]);
+  const path = join(dir, `${name}.xlsx`);
+  await writeFile(path, zip);
+  return path;
+}
+
 async function writeSlideDeck(count: number): Promise<string> {
   const entries = [{ name: "[Content_Types].xml", data: `<?xml version="1.0"?><Types/>` }];
   for (let i = 1; i <= count; i++) {
@@ -69,13 +80,18 @@ async function writeSlideDeck(count: number): Promise<string> {
 }
 
 describe("PreviewScope (round 10, issue #4)", () => {
-  it("normalizeScopeKey is canonical: field order never changes the key", () => {
+  it("normalizeScopeKey is canonical AND collision-free (round 10 reopen)", () => {
     const a = normalizeScopeKey({ location: { sheet: "Data" }, maxEntries: 20 });
     const b = normalizeScopeKey({ maxEntries: 20, location: { sheet: "Data" } });
-    expect(a).toBe(b);
-    expect(a).toContain("sheet=Data");
+    expect(a).toBe(b); // field order never matters
+    // Deliberate collision probe: a sheet NAME containing raw delimiters must
+    // never alias a different scope (JSON tuple keeps values escaped).
+    expect(normalizeScopeKey({ location: { sheet: "A|max=1" } })).not.toBe(
+      normalizeScopeKey({ location: { sheet: "A" }, maxEntries: 1 })
+    );
     expect(normalizeScopeKey(undefined)).toBe("");
-    expect(normalizeScopeKey({})).toBe("");
+    // An explicit empty scope is its own (stable) key, distinct from none.
+    expect(normalizeScopeKey({})).toBe("[null,null,null,null,null]");
   });
 
   it("xlsx: sheet scope windows into the named sheet; range slices the window", async () => {
@@ -107,6 +123,44 @@ describe("PreviewScope (round 10, issue #4)", () => {
     const first = await renderPptxOutline(path);
     if (first.kind !== "pptx") throw new Error("expected pptx");
     expect(first.slides[0]!.index).toBe(1);
+  });
+
+  it("svgWindowOf: outline and SVG always derive from the same slide window (round 10 reopen)", () => {
+    expect(svgWindowOf(25, undefined, 6)).toEqual({ from: 0, count: 6 }); // default: first 6
+    expect(svgWindowOf(25, { location: { slide: 20 } }, 6)).toEqual({ from: 19, count: 6 }); // slides 20-25
+    expect(svgWindowOf(25, { location: { slide: 20 }, maxEntries: 2 }, 6)).toEqual({ from: 19, count: 2 });
+    expect(svgWindowOf(25, { location: { slide: 90 } }, 6)).toEqual({ from: 24, count: 1 }); // clamped tail
+    expect(svgWindowOf(0, undefined, 6)).toEqual({ from: 0, count: 0 }); // empty deck
+  });
+
+  it("xlsx fallback: a range starting beyond column 24 resolves (AA10:AC20)", async () => {
+    // Refs out to AC (col 29) — the default 24-column parse cap used to
+    // yield an empty window for any fromCol > 24.
+    const mk = (r: number) =>
+      ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC"]
+        .map((col, i) => `<c r="${col}${r}"><v>${col}${r}</v></c>`)
+        .join("");
+    const rows = Array.from({ length: 20 }, (_, i) => `<row r="${i + 1}">${mk(i + 1)}</row>`).join("");
+    const path = await writeRawSheetWorkbook("high-columns", rows);
+    const outline = await renderXlsxOutline(path, {
+      location: { range: { fromRow: 10, toRow: 20, fromCol: 27, toCol: 29 } }
+    });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets[0]!.window[0]).toEqual(["AA10", "AB10", "AC10"]);
+    expect(outline.sheets[0]!.window[10]).toEqual(["AA20", "AB20", "AC20"]);
+    expect(outline.sheets[0]!.window).toHaveLength(11);
+  });
+
+  it("xlsx fallback: maxEntries narrows an explicit range but never extends past toRow", async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => `<row r="${i + 1}"><c r="A${i + 1}"><v>${i + 1}</v></c></row>`).join("");
+    const path = await writeRawSheetWorkbook("torow-bound", rows);
+    const outline = await renderXlsxOutline(path, {
+      location: { range: { fromRow: 5, toRow: 10, fromCol: 1, toCol: 1 } },
+      maxEntries: 100 // larger than the range — toRow must still bound it
+    });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets[0]!.window).toHaveLength(6); // rows 5..10 exactly
+    expect(outline.sheets[0]!.window.map((row) => row[0])).toEqual(["5", "6", "7", "8", "9", "10"]);
   });
 
   it("two scopes of one artifact never share a cache entry or dedup promise", async () => {

@@ -281,7 +281,9 @@ export class OfficeRuntimeService {
       artifactRef: request.artifactRef,
       priority: request.priority,
       scope: request.scope,
-      visual: request.visual
+      visual: request.visual,
+      // Round 10 reopen: consumer cancellation must survive the public path.
+      signal: request.signal
     });
   }
 

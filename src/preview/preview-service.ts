@@ -18,9 +18,9 @@ import { fileFingerprint, fingerprintKey } from "../support/fsx.js";
 import { ArtifactRegistry } from "../artifact/registry/artifact-registry.js";
 import { ByteBudgetCache } from "../artifact/cache/byte-budget-cache.js";
 import type { ArtifactStore } from "../artifact/store/artifact-store.js";
-import type { Scheduler } from "../runtime/scheduler/scheduler.js";
-import type { SchedulerPriorityName } from "../contracts/scheduler.js";
-import type { ArtifactContext } from "../contracts/artifact.js";
+import { Scheduler, type ScheduledHandle, type SchedulerJob } from "../runtime/scheduler/scheduler.js";
+import { SCHEDULER_PRIORITIES, type SchedulerPriorityName } from "../contracts/scheduler.js";
+import type { ArtifactContext, ArtifactLease } from "../contracts/artifact.js";
 import type { PreviewOutline } from "../contracts/preview.js";
 import {
   GenOfficeDocxFormatRuntime,
@@ -31,39 +31,44 @@ import { elementText, buildRenderSlide } from "../vendor/genoffice/wrapper.js";
 import { isRenderSlideLike, renderSlideToSvg } from "../vendor/genoffice/render-svg.js";
 import { renderDocxOutline, renderPptxOutline, renderXlsxOutline } from "./outline-renderers.js";
 
-/** Shared in-flight render: joiners promote the scheduler handles upward. */
+/** Shared scheduler handle surface used by the in-flight render entry. */
+interface SharedHandle {
+  cancel(): void;
+  promote(priority: SchedulerPriorityName): void;
+}
+
+/**
+ * Shared in-flight render (round 10 reopen hardening):
+ *  - `consumers` refcounts live preview consumers; shared queued work is
+ *    cancelled only when the LAST consumer detaches (registry parity);
+ *  - `highestIndex` remembers the best consumer priority — handles created
+ *    AFTER a join (e.g. still inside registry.acquire) promote to it
+ *    immediately, so inheritance no longer depends on handle creation order;
+ *  - every consumer performs its own registry.acquire — joiners promote a
+ *    still-queued build through the registry's own last-consumer semantics.
+ */
 interface InflightRender {
   promise: Promise<PreviewModel>;
-  handles: Array<{ promote(priority: SchedulerPriorityName): void }>;
+  handles: SharedHandle[];
+  highestIndex: number;
+  consumers: Set<string>;
 }
 
 /**
  * Round 10: canonical scope key — cache/dedup identity includes the window.
- * Field order is fixed so equal scopes always produce equal keys.
+ * Encoded as a fixed-order JSON tuple: values keep their delimiters, so
+ * `{sheet:"A|max=1"}` and `{sheet:"A",maxEntries:1}` can never collide.
  */
 export function normalizeScopeKey(scope?: PreviewScope): string {
   if (!scope) return "";
   const loc = scope.location ?? {};
-  const parts: string[] = [];
-  if (loc.sheet !== undefined) parts.push(`sheet=${loc.sheet}`);
-  if (loc.slide !== undefined) parts.push(`slide=${loc.slide}`);
-  if (loc.block !== undefined) parts.push(`block=${loc.block}`);
-  if (loc.range) {
-    parts.push(`range=${loc.range.fromRow},${loc.range.fromCol}-${loc.range.toRow},${loc.range.toCol}`);
-  }
-  if (scope.maxEntries !== undefined) parts.push(`max=${scope.maxEntries}`);
-  return parts.join("|");
-}
-
-/** Consumer abort dequeues queued scheduler work before it reaches the
- *  sidecar/engine; running work finishes (its result is simply unused). */
-function wireConsumerAbort(signal: AbortSignal | undefined, handle: { cancel(): void }): void {
-  if (!signal) return;
-  if (signal.aborted) {
-    handle.cancel();
-    return;
-  }
-  signal.addEventListener("abort", () => handle.cancel(), { once: true });
+  return JSON.stringify([
+    loc.sheet ?? null,
+    loc.slide ?? null,
+    loc.block ?? null,
+    loc.range ? [loc.range.fromRow, loc.range.fromCol, loc.range.toRow, loc.range.toCol] : null,
+    scope.maxEntries ?? null
+  ]);
 }
 
 /** Build an outline from a GenOffice-parsed context, or undefined when absent.
@@ -95,15 +100,33 @@ function outlineFromGenOffice(context: ArtifactContext, scope?: PreviewScope): P
   return undefined;
 }
 
-/** Headless visual render: slide draw lists → standalone SVG strings (§P7). */
-function svgSlidesFromGenOffice(context: ArtifactContext, maxSlides: number): string[] | undefined {
+/**
+ * The scoped SVG slide window (pure math, exported for tests): outline and
+ * SVG must always derive from the SAME window — `visual + slide 20` used to
+ * render slides 1–6 while the outline showed 20+.
+ */
+export function svgWindowOf(
+  slideCount: number,
+  scope: PreviewScope | undefined,
+  max: number
+): { from: number; count: number } {
+  const anchor = Math.max(0, Math.floor((scope?.location?.slide ?? 1) - 1));
+  const from = Math.min(anchor, Math.max(0, slideCount - 1));
+  const count = Math.max(0, Math.min(max, scope?.maxEntries ?? max, slideCount - from));
+  return { from, count };
+}
+
+/** Headless visual render: slide draw lists → standalone SVG strings (§P7).
+ *  Round 10: honors the scoped slide window (same slice as the outline). */
+function svgSlidesFromGenOffice(context: ArtifactContext, scope?: PreviewScope): string[] | undefined {
   if (context.format !== "pptx") return undefined;
   const deck = GenOfficePptxFormatRuntime.deckOf(context);
   if (!deck) return undefined;
+  const { from, count } = svgWindowOf(deck.slides.length, scope, 6);
   const out: string[] = [];
-  for (const [i, slide] of deck.slides.slice(0, maxSlides).entries()) {
+  for (const [i, slide] of deck.slides.slice(from, from + count).entries()) {
     try {
-      const drawList = buildRenderSlide(slide, deck.size, { fitWidthPx: 960, slideNo: i + 1 });
+      const drawList = buildRenderSlide(slide, deck.size, { fitWidthPx: 960, slideNo: from + i + 1 });
       if (isRenderSlideLike(drawList)) out.push(renderSlideToSvg(drawList));
     } catch {
       // Visual rendering is best-effort per slide; the outline still serves.
@@ -124,7 +147,14 @@ const PRIORITY_MAP = {
 export interface XlsxSidecarPort {
   previewWindow(
     path: string,
-    options?: { sheet?: string; maxRows?: number; maxCols?: number; maxSheets?: number }
+    options?: {
+      sheet?: string;
+      /** 1-based inclusive window origin+extent (round 10). */
+      range?: { fromRow: number; toRow: number; fromCol: number; toCol: number };
+      maxRows?: number;
+      maxCols?: number;
+      maxSheets?: number;
+    }
   ): Promise<Array<{ name: string; window: string[][]; rowCount?: number }>>;
 }
 
@@ -143,7 +173,11 @@ export class PreviewService {
    * (never downward) instead of duplicating the parse work.
    */
   private promoteInflight(entry: InflightRender, priority: keyof typeof PRIORITY_MAP): void {
-    for (const handle of entry.handles) handle.promote(PRIORITY_MAP[priority]);
+    const index = SCHEDULER_PRIORITIES.indexOf(PRIORITY_MAP[priority]);
+    if (index < entry.highestIndex) {
+      entry.highestIndex = index;
+      for (const handle of entry.handles) handle.promote(PRIORITY_MAP[priority]);
+    }
   }
 
   constructor(
@@ -190,28 +224,93 @@ export class PreviewService {
     fingerprint: { size: bigint; mtimeNs: bigint; fileId?: string },
     scopeKey: string
   ): Promise<PreviewModel> {
-    const inflight = this.inflightDedup.get(cacheKeyString);
-    if (inflight) {
-      // Round 10 (P1): join the shared work — no duplicate parse — but
-      // inherit the consumer's priority (promote handles upward only).
-      this.promoteInflight(inflight, request.priority);
-      return inflight.promise;
-    }
-
-    const handles: Array<{ promote(priority: SchedulerPriorityName): void }> = [];
-    const entry: InflightRender = { promise: undefined as never, handles };
-    const job = (async () => {
-      // Registry acquire: dedupes parses across preview/open/edit consumers (§23).
-      const lease = await this.registry.acquire({
+    const consumerId = `preview:${request.requestId}`;
+    const existing = this.inflightDedup.get(cacheKeyString);
+    const first = !existing;
+    const shared: InflightRender = existing ?? {
+      promise: undefined as never,
+      handles: [],
+      highestIndex: SCHEDULER_PRIORITIES.indexOf(PRIORITY_MAP[request.priority]),
+      consumers: new Set<string>()
+    };
+    if (first) {
+      this.inflightDedup.set(cacheKeyString, shared);
+      // The FIRST consumer's acquire also seeds the shared render with its
+      // context lease; the lease is released when the shared render settles.
+      const seed = this.registry.acquire({
         artifactRef: request.artifactRef,
         format,
         consistency: "optimistic",
-        // P0-7: quick previews stay light (ZIP/index); visual previews
-        // upgrade to the full engine read model.
         profile: request.visual ? "full" : "metadata",
         priority: PRIORITY_MAP[request.priority],
-        consumer: `preview:${request.requestId}`
+        consumer: consumerId,
+        signal: request.signal
       });
+      shared.promise = this.runSharedRender(shared, request, format, path, cacheKeyString, fingerprint, scopeKey, seed);
+    }
+
+    // Every consumer (first included) registers itself. A detaching consumer
+    // removes only ITSELF; the shared queued work is cancelled when the LAST
+    // consumer leaves — matching the registry's build semantics.
+    shared.consumers.add(consumerId);
+    this.promoteInflight(shared, request.priority);
+    if (request.signal) {
+      const detach = () => {
+        shared.consumers.delete(consumerId);
+        if (shared.consumers.size === 0) {
+          for (const handle of shared.handles) handle.cancel();
+        }
+      };
+      if (request.signal.aborted) detach();
+      else request.signal.addEventListener("abort", detach, { once: true });
+    }
+
+    // Joiners acquire the registry context themselves: the acquire JOINS the
+    // same build (no duplicate parse) and promotes a still-queued build to
+    // this consumer's priority — inheritance works even while the shared
+    // render is still inside its own registry.acquire (no handles yet).
+    const ownLease = first
+      ? undefined
+      : await this.registry.acquire({
+          artifactRef: request.artifactRef,
+          format,
+          consistency: "optimistic",
+          profile: request.visual ? "full" : "metadata",
+          priority: PRIORITY_MAP[request.priority],
+          consumer: consumerId,
+          signal: request.signal
+        });
+    try {
+      return await shared.promise;
+    } finally {
+      ownLease?.release();
+      shared.consumers.delete(consumerId);
+    }
+  }
+
+  private async runSharedRender(
+    entry: InflightRender,
+    request: PreviewRequest,
+    format: OfficeFormat,
+    path: string,
+    cacheKeyString: string,
+    fingerprint: { size: bigint; mtimeNs: bigint; fileId?: string },
+    scopeKey: string,
+    seedLease: Promise<ArtifactLease>
+  ): Promise<PreviewModel> {
+    /** Submit shared work under the CURRENT best priority; later joins keep
+     *  promoting it via entry.handles. A submission racing the LAST consumer
+     *  detaching (e.g. the fallback renderer after a cancelled sidecar read)
+     *  cancels itself immediately — no orphaned queued work. */
+    const submitShared = <T>(job: Omit<SchedulerJob<T>, "priority">): ScheduledHandle<T> => {
+      const priority = SCHEDULER_PRIORITIES[entry.highestIndex]!;
+      const handle = this.scheduler.submit<T>({ ...job, priority });
+      entry.handles.push(handle);
+      if (entry.consumers.size === 0) handle.cancel();
+      return handle;
+    };
+    try {
+      const lease = await seedLease;
       try {
         // §146 L6: prefer the GenOffice engine model already attached to the
         // context (deck / blocks); fall back to the streaming zip renderers.
@@ -221,41 +320,46 @@ export class PreviewService {
         // the native call runs as a Scheduler job under the SAME priority
         // ladder; the dedicated single-flight permit matches the sidecar's
         // one native thread (general io/native budgets would let 4+ previews
-        // enter the serial FIFO ahead of a later visible one).
+        // enter the serial FIFO ahead of a later visible one). The full range
+        // (origin + extent, 1-based) is forwarded — a resized top-left window
+        // is not a range.
         if (!outline && format === "xlsx" && this.xlsxSidecar) {
           const sidecar = this.xlsxSidecar;
           const range = request.scope?.location?.range;
-          const handle = this.scheduler.submit({
+          const handle = submitShared({
             label: `preview-xlsx-sidecar:${request.artifactRef}`,
-            priority: PRIORITY_MAP[request.priority],
             resources: { io: 1, xlsxSidecar: 1 },
             run: async (signal) => {
               if (signal.aborted) throw new DOMException("cancelled", "AbortError");
               return await sidecar.previewWindow(path, {
                 sheet: request.scope?.location?.sheet,
+                range,
                 maxRows: request.scope?.maxEntries ?? (range ? range.toRow - range.fromRow + 1 : undefined),
                 maxCols: range ? range.toCol - range.fromCol + 1 : undefined
               });
             }
           });
-          handles.push(handle);
-          wireConsumerAbort(request.signal, handle);
           outline = await handle.promise
             .then((sheets): PreviewOutline => ({
               kind: "xlsx",
               sheets: sheets.map((sheet) => ({
                 name: sheet.name,
                 rowCount: sheet.rowCount ?? sheet.window.length,
-                rowCountExact: true, // sidecar sheet metadata is authoritative
+                // Exact ONLY when native metadata provided a real extent;
+                // window.length alone is a lower bound.
+                rowCountExact: sheet.rowCount !== undefined,
                 window: sheet.window
               }))
             }))
             .catch(() => undefined);
         }
         if (!outline) {
-          const handle = this.scheduler.submit({
+          // Everyone left while the sidecar attempt was being cancelled —
+          // do not fall back into fresh work for abandoned consumers.
+          if (entry.consumers.size === 0) throw new DOMException("cancelled", "AbortError");
+          const handle = submitShared({
             label: `preview-render:${request.artifactRef}`,
-            priority: PRIORITY_MAP[request.priority],
+            resources: { io: 1 },
             run: async () => {
               switch (format) {
                 case "docx":
@@ -267,9 +371,23 @@ export class PreviewService {
               }
             }
           });
-          handles.push(handle);
-          wireConsumerAbort(request.signal, handle);
           outline = await handle.promise;
+        }
+        // Round 10 (P1): headless SVG generation is real CPU/render work —
+        // it no longer runs unadmitted inside the shared promise.
+        let svgSlides: string[] | undefined;
+        if (request.visual) {
+          const context = lease.context;
+          const handle = submitShared({
+            label: `preview-svg:${request.artifactRef}`,
+            resources: { render: 1, cpu: 1 },
+            run: async (signal) => {
+              if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+              return svgSlidesFromGenOffice(context, request.scope) ?? [];
+            }
+          });
+          const svgs = await handle.promise.catch(() => undefined);
+          svgSlides = svgs && svgs.length > 0 ? svgs : undefined;
         }
         const cacheKey: PreviewCacheKey = {
           contentHash: fingerprintKey(fingerprint),
@@ -283,8 +401,7 @@ export class PreviewService {
           outline,
           cacheKey,
           fingerprintAtRender: fingerprintKey(fingerprint),
-          // SVG rendering requires the full engine model (visual profile only).
-          svgSlides: request.visual ? svgSlidesFromGenOffice(lease.context, 6) : undefined
+          svgSlides
         };
         if (this.cache.admit(JSON.stringify(model).length)) {
           this.cache.set(cacheKeyString, model);
@@ -293,12 +410,6 @@ export class PreviewService {
       } finally {
         lease.release();
       }
-    })();
-
-    entry.promise = job;
-    this.inflightDedup.set(cacheKeyString, entry);
-    try {
-      return await job;
     } finally {
       this.inflightDedup.delete(cacheKeyString);
     }

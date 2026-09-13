@@ -244,15 +244,26 @@ export class XlsxSidecarClient {
  * Bounded preview window through the sidecar (§30 read path letter):
  * open → sheet viewport(s) → close. Rejects when the sidecar is unavailable —
  * callers fall back to the in-process renderer. Round 10: `sheet` selects a
- * named sheet (falling back to the workbook order when unresolvable).
+ * named sheet; `range` (1-based, inclusive) also carries the window ORIGIN —
+ * `Data!D10:F30` must read from D10, not merely resize the top-left window.
  */
 export async function sidecarPreviewWindow(
   client: XlsxSidecarClient,
   path: string,
-  options: { sheet?: string; maxRows?: number; maxCols?: number; maxSheets?: number } = {}
+  options: {
+    sheet?: string;
+    /** 1-based inclusive window origin+extent; converted to the native
+     *  0-based protocol here — the only place the bases meet. */
+    range?: { fromRow: number; toRow: number; fromCol: number; toCol: number };
+    maxRows?: number;
+    maxCols?: number;
+    maxSheets?: number;
+  } = {}
 ): Promise<Array<{ name: string; window: string[][]; rowCount?: number }>> {
   const maxRows = options.maxRows ?? 40;
   const maxCols = options.maxCols ?? 16;
+  const startRow0 = options.range ? Math.max(0, Math.floor(options.range.fromRow) - 1) : 0;
+  const startCol0 = options.range ? Math.max(0, Math.floor(options.range.fromCol) - 1) : 0;
   const opened = await client.open(path);
   const out: Array<{ name: string; window: string[][]; rowCount?: number }> = [];
   const sheets = options.sheet
@@ -265,14 +276,25 @@ export async function sidecarPreviewWindow(
     : opened.sheets;
   try {
     for (const sheet of sheets.slice(0, options.maxSheets ?? 4)) {
-      // Clamp to the sheet's declared extent; fall back to a probe window
-      // when metadata omits dimensions (read_range rejects out-of-sheet).
+      // Clamp the WINDOW SIZE to the sheet's declared extent (fall back to a
+      // probe window when metadata omits dimensions — read_range rejects
+      // out-of-sheet reads); the origin offsets stay as requested.
       const rows = Math.max(1, Math.min(maxRows, sheet.rowCount ?? maxRows));
       const cols = Math.max(1, Math.min(maxCols, sheet.columnCount ?? maxCols));
       let result = await client
-        .readRange(opened.sessionId, sheet.id, { startRow: 0, endRow: rows - 1, startColumn: 0, endColumn: cols - 1 })
+        .readRange(opened.sessionId, sheet.id, {
+          startRow: startRow0,
+          endRow: startRow0 + rows - 1,
+          startColumn: startCol0,
+          endColumn: startCol0 + cols - 1
+        })
         .catch(async () =>
-          client.readRange(opened.sessionId, sheet.id, { startRow: 0, endRow: 4, startColumn: 0, endColumn: 4 })
+          client.readRange(opened.sessionId, sheet.id, {
+            startRow: startRow0,
+            endRow: startRow0 + 4,
+            startColumn: startCol0,
+            endColumn: startCol0 + 4
+          })
         );
       result = await result;
       out.push({ name: sheet.name, window: normalizeWindow(result, maxRows, maxCols), rowCount: sheet.rowCount });
