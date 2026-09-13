@@ -27,6 +27,19 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: npm install -g @officecli/officecli
+      # libuv#5010 / node#63638: Node 24.16+ crashes with a C-level assertion
+      # in fs-event.c whenever ANY process fs.watch()es an 8.3 short path —
+      # and the runner's default TEMP/TMP are short paths (RUNNER~1). Point
+      # them at a guaranteed long-path directory so os.tmpdir() (our
+      # fixtures, the OfficeCLI engine's own watchers) never sees a short
+      # component.
+      - name: Long-path TEMP (libuv fs-event 8.3 crash workaround)
+        shell: pwsh
+        run: |
+          $longTemp = "D:\a\_longtemp"
+          New-Item -ItemType Directory -Force -Path $longTemp | Out-Null
+          "TEMP=$longTemp" >> $env:GITHUB_ENV
+          "TMP=$longTemp" >> $env:GITHUB_ENV
       - name: Install
         run: npm ci
       - name: Build vendor bundles
