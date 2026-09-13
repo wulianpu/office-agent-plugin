@@ -173,6 +173,12 @@ export class PreviewService {
     (model) => JSON.stringify(model).length
   );
   private inflightDedup = new Map<string, InflightRender>();
+  /** Monotonic per-CALL consumer token source — external requestIds are
+   *  correlation labels only (callers may reuse them across concurrent
+   *  calls); the refcount Set must key on unique call instances or two
+   *  real consumers with one requestId collapse into one and a single
+   *  abort kills both (round 10 reopen #4). */
+  private consumerSeq = 0;
 
   /**
    * Round 10 priority inheritance: a later VISIBLE consumer joining an
@@ -231,7 +237,9 @@ export class PreviewService {
     fingerprint: { size: bigint; mtimeNs: bigint; fileId?: string },
     scopeKey: string
   ): Promise<PreviewModel> {
-    const consumerId = `preview:${request.requestId}`;
+    // Internal per-call lifecycle identity (see consumerSeq): requestId stays
+    // a diagnostic/correlation label in registry consumer strings.
+    const consumerId = `preview:${++this.consumerSeq}:${request.requestId}`;
     const existing = this.inflightDedup.get(cacheKeyString);
     const first = !existing;
     const shared: InflightRender = existing ?? {
@@ -379,11 +387,20 @@ export class PreviewService {
             resources: { io: 1, xlsxSidecar: 1 },
             run: async (signal) => {
               if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+              // Round 10 reopen #4: an explicit range is a HARD boundary —
+              // maxEntries may only NARROW it (range height wins the min),
+              // matching the JS fallback's toRow/toCol hard-stop. Passing a
+              // larger maxEntries used to extend A5:A10 toward A104 on the
+              // sidecar path only.
+              const rangeHeight = range ? range.toRow - range.fromRow + 1 : undefined;
+              const rangeWidth = range ? range.toCol - range.fromCol + 1 : undefined;
               return await sidecar.previewWindow(path, {
                 sheet: request.scope?.location?.sheet,
                 range,
-                maxRows: request.scope?.maxEntries ?? (range ? range.toRow - range.fromRow + 1 : undefined),
-                maxCols: range ? range.toCol - range.fromCol + 1 : undefined
+                maxRows: range
+                  ? Math.min(rangeHeight!, request.scope?.maxEntries ?? rangeHeight!)
+                  : request.scope?.maxEntries,
+                maxCols: range ? rangeWidth : undefined
               });
             }
           });

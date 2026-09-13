@@ -295,8 +295,13 @@ export async function sidecarPreviewWindow(
         out.push({ name: sheet.name, window: [], rowCount: sheet.rowCount });
         continue;
       }
-      const rows = Math.max(1, Math.min(maxRows, remainingRows ?? maxRows));
-      const cols = Math.max(1, Math.min(maxCols, remainingCols ?? maxCols));
+      // Round 10 reopen #4: an explicit range's toRow/toCol is the FINAL
+      // hard boundary — a caller-passed maxRows/maxCols larger than the
+      // range span can never extend the window past it.
+      const spanRows = options.range ? options.range.toRow - options.range.fromRow + 1 : undefined;
+      const spanCols = options.range ? options.range.toCol - options.range.fromCol + 1 : undefined;
+      const rows = Math.max(1, Math.min(maxRows, remainingRows ?? maxRows, spanRows ?? maxRows));
+      const cols = Math.max(1, Math.min(maxCols, remainingCols ?? maxCols, spanCols ?? maxCols));
       const read = () =>
         client.readRange(opened.sessionId, sheet.id, {
           startRow: startRow0,

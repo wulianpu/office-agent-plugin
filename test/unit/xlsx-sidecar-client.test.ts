@@ -115,6 +115,37 @@ describe("sidecarPreviewWindow scope boundaries (round 10 reopen #3)", () => {
     expect(out[0]!.window).toHaveLength(11);
   });
 
+  it("maxEntries can NARROW an explicit range but never EXTEND it (round 10 reopen #4)", async () => {
+    // A5:A10 with a caller-passed window of 100 rows: the range span (6)
+    // wins the min — endRow must stop at row 10, not run toward A104.
+    const reads: Array<Record<string, number>> = [];
+    const cells = Array.from({ length: 6 }, (_, i) => ({ row: 4 + i, column: 0, value: "A" + (5 + i) }));
+    const fake = fakeClient([{ id: "1", name: "S", rowCount: 200, columnCount: 3 }], reads, cells);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", {
+      range: { fromRow: 5, toRow: 10, fromCol: 1, toCol: 1 },
+      maxRows: 100,
+      maxCols: 1
+    });
+    expect(reads[0]).toEqual({ startRow: 4, endRow: 9, startColumn: 0, endColumn: 0 });
+    expect(out[0]!.window).toHaveLength(6); // rows 5..10 exactly
+  });
+
+  it("maxEntries narrowing wins: A5:A10 + 3-entry cap -> rows 5..7", async () => {
+    const reads: Array<Record<string, number>> = [];
+    const fake = fakeClient([{ id: "1", name: "S", rowCount: 200, columnCount: 3 }], reads, [
+      { row: 4, column: 0, value: "A5" },
+      { row: 5, column: 0, value: "A6" },
+      { row: 6, column: 0, value: "A7" }
+    ]);
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", {
+      range: { fromRow: 5, toRow: 10, fromCol: 1, toCol: 1 },
+      maxRows: 3,
+      maxCols: 1
+    });
+    expect(reads[0]).toEqual({ startRow: 4, endRow: 6, startColumn: 0, endColumn: 0 });
+    expect(out[0]!.window).toHaveLength(3);
+  });
+
   it("an origin beyond the declared extent yields an explicitly empty window without reads", async () => {
     const reads: Array<Record<string, number>> = [];
     const fake = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads);

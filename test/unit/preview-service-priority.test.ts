@@ -403,6 +403,101 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     await a.catch(() => undefined);
   });
 
+  it("duplicate external requestIds never collapse consumers: B aborts, A still succeeds (round 10 reopen #4)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "dup-id.xlsx");
+    await writeFile(path, Buffer.alloc(24, 12));
+    registry.setPathResolver(() => path);
+
+    let releaseSidecar!: () => void;
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => {
+          await new Promise<void>((resolve) => (releaseSidecar = resolve));
+          return [{ name: "Sheet1", window: [["dup"]], rowCount: 1 }];
+        }
+      }
+    );
+
+    let releaseBlocker!: () => void;
+    const blocker = scheduler.submit({
+      label: "blocker",
+      priority: "INTERACTIVE",
+      run: () => new Promise<void>((resolve) => (releaseBlocker = resolve))
+    });
+    void blocker.promise.catch(() => undefined);
+    await waitFor(() => scheduler.runningCount === 1);
+
+    // SAME artifact + scope + SAME external requestId: two real calls.
+    const controllerB = new AbortController();
+    const a = service.preview({ requestId: "dup", artifactRef: "art-dup", priority: "background" });
+    void a.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 1);
+    const b = service.preview({ requestId: "dup", artifactRef: "art-dup", priority: "background", signal: controllerB.signal });
+    void b.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    controllerB.abort(); // B alone detaches — A must survive
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(1); // shared work NOT cancelled
+
+    releaseBlocker();
+    await waitFor(() => scheduler.queueDepth === 0);
+    releaseSidecar();
+    const modelA = await a; // A succeeds — one abort no longer kills both
+    expect(modelA.model.outline.kind).toBe("xlsx");
+    await b.catch(() => undefined);
+  });
+
+  it("duplicate requestIds: the shared work cancels only after BOTH consumers abort (round 10 reopen #4)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "dup-both.xlsx");
+    await writeFile(path, Buffer.alloc(24, 13));
+    registry.setPathResolver(() => path);
+    let entered = 0;
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler,
+      {
+        previewWindow: async () => {
+          entered++;
+          return [{ name: "Sheet1", window: [["x"]], rowCount: 1 }];
+        }
+      }
+    );
+
+    const blocker = scheduler.submit({ label: "blocker", priority: "INTERACTIVE", run: () => new Promise<void>(() => undefined) });
+    void blocker.promise.catch(() => undefined);
+    await waitFor(() => scheduler.runningCount === 1);
+
+    const ca = new AbortController();
+    const cb = new AbortController();
+    const a = service.preview({ requestId: "same", artifactRef: "art-same", priority: "background", signal: ca.signal });
+    const b = service.preview({ requestId: "same", artifactRef: "art-same", priority: "background", signal: cb.signal });
+    void a.catch(() => undefined);
+    void b.catch(() => undefined);
+    await waitFor(() => scheduler.queueDepth === 1);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    ca.abort(); // first of the two leaves
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(1); // the other duplicate still alive
+    cb.abort(); // last one leaves
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduler.queueDepth).toBe(0); // NOW the shared work dequeues
+    blocker.cancel();
+    expect(entered).toBe(0);
+  });
+
   it("consumer-aware cancellation: one joiner aborting never kills the other's shared work (round 10 reopen)", async () => {
     const scheduler = new Scheduler({ maxConcurrent: 1 });
     const registry = new ArtifactRegistry();
@@ -607,6 +702,26 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     expect(received[0]!.sheet).toBe("Data");
     // rowCountExact honors real metadata only.
     expect(result.model.outline.sheets[0]!.rowCountExact).toBe(true);
+
+    // Round 10 reopen #4: maxEntries larger than the range span must be
+    // pre-clamped to the range height at the service layer (21), and a
+    // smaller maxEntries wins (3).
+    received.length = 0;
+    await service.preview({
+      requestId: "range-2",
+      artifactRef: "art-range",
+      priority: "visible",
+      scope: { location: { sheet: "Data", range: { fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 } }, maxEntries: 100 }
+    });
+    expect(received[0]!.maxRows).toBe(21); // range height, not 100
+    received.length = 0;
+    await service.preview({
+      requestId: "range-3",
+      artifactRef: "art-range",
+      priority: "visible",
+      scope: { location: { sheet: "Data", range: { fromRow: 10, toRow: 30, fromCol: 4, toCol: 6 } }, maxEntries: 3 }
+    });
+    expect(received[0]!.maxRows).toBe(3); // narrowing wins
   });
 
   it("consumer abort dequeues a queued sidecar preview before it reaches the native process (round 10)", async () => {
