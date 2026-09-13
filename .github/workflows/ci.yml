@@ -31,6 +31,8 @@ jobs:
         run: npm ci
       - name: Build vendor bundles
         run: npm run build:vendor
+      - name: Build dist (process-restart suites run against dist/)
+        run: npx tsc -p tsconfig.json
       - name: Check (src + tests)
         run: npm run check
       - name: Unit tests
@@ -59,6 +61,8 @@ jobs:
         run: npm ci
       - name: Build vendor bundles
         run: npm run build:vendor
+      - name: Build dist (process-restart suites run against dist/)
+        run: npx tsc -p tsconfig.json
       - name: Check (src + tests)
         run: npm run check
       - name: Unit tests
