@@ -40,7 +40,7 @@ import { SessionManager } from "../sessions/session-manager.js";
 import { RevisionLog } from "../revisions/revision-log.js";
 import { CandidateManager } from "../candidates/candidate-manager.js";
 import { AtomicFileCommitter } from "../commit/atomic-file-committer.js";
-import { SelfWriteGuardRegistry, SourceWatcher } from "../commit/self-write-guard.js";
+import { longFormPath, SelfWriteGuardRegistry, SourceWatcher } from "../commit/self-write-guard.js";
 import { RecoveryService } from "../recovery/recovery-service.js";
 import { promoteToEdit } from "../sessions/edit-promotion.js";
 import { OfficeCliAdapter } from "../../agent/officecli/officecli-adapter.js";
@@ -708,7 +708,9 @@ export class OfficeRuntimeService {
   private async handleSourceMutation(sourcePath: string, kind: "self-write" | "external"): Promise<void> {
     if (kind === "self-write") return;
     for (const session of this.sessions.list()) {
-      if (this.store.resolvePath(session.artifactRef) !== sourcePath) continue;
+      // Watcher events arrive long-form (8.3-short TEMP paths are normalized
+      // inside SourceWatcher); compare the store path in the same form.
+      if (longFormPath(this.store.resolvePath(session.artifactRef)) !== sourcePath) continue;
       this.sessions.updateSession(session.sessionId, (s) => {
         s.lifecycle = s.lifecycle === "ready" ? "conflict" : s.lifecycle;
       });

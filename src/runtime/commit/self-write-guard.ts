@@ -18,13 +18,15 @@ export class SelfWriteGuardRegistry {
   /**
    * When a watcher event fires for a path: if an active guard exists and the
    * file now hashes to the guard's expected value, the event is self-originated.
+   * Comparison is long-form on both sides (watcher events arrive long-form).
    */
   async isSelfWrite(sourcePath: string): Promise<boolean> {
     this.sweep();
+    const canonical = longFormPath(sourcePath);
     for (const guard of this.guards.values()) {
-      if (guard.sourcePath !== sourcePath) continue;
+      if (longFormPath(guard.sourcePath) !== canonical) continue;
       if (Date.now() > guard.expiresAt) continue;
-      const hash = await sha256File(sourcePath).catch(() => undefined);
+      const hash = await sha256File(canonical).catch(() => undefined);
       if (hash === guard.expectedHash) return true;
     }
     return false;
@@ -48,12 +50,29 @@ export class SelfWriteGuardRegistry {
  * filesystem hashes).
  */
 
-import { watch, type FSWatcher } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { realpathSync, watch, type FSWatcher } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 export interface SourceMutationEvent {
   sourcePath: string;
   kind: "self-write" | "external";
+}
+
+/**
+ * Canonical long-form path (dir via realpath + basename). Windows 8.3 short
+ * paths (e.g. RUNNER~1 from %TEMP%) crash libuv's fs-event watcher: the OS
+ * reports long-name files whose prefix no longer matches the short watched
+ * directory — a C-level assertion that ABORTS the process. Every path that
+ * reaches watch()/watcher callbacks is normalized through here so both sides
+ * always compare in the same form.
+ */
+export function longFormPath(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return join(realpathSync(dirname(absolute)), basename(absolute));
+  } catch {
+    return absolute;
+  }
 }
 
 export class SourceWatcher {
@@ -69,7 +88,7 @@ export class SourceWatcher {
   constructor(private readonly selfWrites: SelfWriteGuardRegistry) {}
 
   watchFile(sourcePath: string): void {
-    const canonical = resolve(sourcePath);
+    const canonical = longFormPath(sourcePath);
     const dir = dirname(canonical);
     let entry = this.dirs.get(dir);
     if (!entry) {
@@ -92,7 +111,7 @@ export class SourceWatcher {
   }
 
   unwatchFile(sourcePath: string): void {
-    const canonical = resolve(sourcePath);
+    const canonical = longFormPath(sourcePath);
     const dir = dirname(canonical);
     const entry = this.dirs.get(dir);
     if (!entry) return;
