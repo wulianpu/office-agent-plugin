@@ -242,20 +242,29 @@ export class XlsxSidecarClient {
 
 /**
  * Bounded preview window through the sidecar (§30 read path letter):
- * open → first sheet viewport → close. Rejects when the sidecar is
- * unavailable — callers fall back to the in-process renderer.
+ * open → sheet viewport(s) → close. Rejects when the sidecar is unavailable —
+ * callers fall back to the in-process renderer. Round 10: `sheet` selects a
+ * named sheet (falling back to the workbook order when unresolvable).
  */
 export async function sidecarPreviewWindow(
   client: XlsxSidecarClient,
   path: string,
-  options: { maxRows?: number; maxCols?: number; maxSheets?: number } = {}
+  options: { sheet?: string; maxRows?: number; maxCols?: number; maxSheets?: number } = {}
 ): Promise<Array<{ name: string; window: string[][]; rowCount?: number }>> {
   const maxRows = options.maxRows ?? 40;
   const maxCols = options.maxCols ?? 16;
   const opened = await client.open(path);
   const out: Array<{ name: string; window: string[][]; rowCount?: number }> = [];
+  const sheets = options.sheet
+    ? [
+        ...(opened.sheets.find((s) => s.name === options.sheet)
+          ? [opened.sheets.find((s) => s.name === options.sheet)!]
+          : []),
+        ...opened.sheets.filter((s) => s.name !== options.sheet)
+      ]
+    : opened.sheets;
   try {
-    for (const sheet of opened.sheets.slice(0, options.maxSheets ?? 4)) {
+    for (const sheet of sheets.slice(0, options.maxSheets ?? 4)) {
       // Clamp to the sheet's declared extent; fall back to a probe window
       // when metadata omits dimensions (read_range rejects out-of-sheet).
       const rows = Math.max(1, Math.min(maxRows, sheet.rowCount ?? maxRows));

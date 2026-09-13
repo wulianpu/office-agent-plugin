@@ -31,6 +31,37 @@ describe("Scheduler (§110–§112)", () => {
     expect(order).toEqual(["fg", "bg"]);
   });
 
+  it("promote moves QUEUED jobs upward only (round 10 priority inheritance)", async () => {
+    const scheduler = new Scheduler({ maxConcurrent: 1 });
+    let release!: () => void;
+    const blocker = scheduler.submit({
+      label: "blocker",
+      priority: "INTERACTIVE",
+      run: () => new Promise<void>((resolve) => (release = resolve))
+    });
+    // Wait until the lane is occupied, then queue two jobs.
+    await new Promise((resolve) => setImmediate(resolve));
+    const low = scheduler.submit({
+      label: "low",
+      priority: "BACKGROUND_INDEX",
+      run: async () => "low"
+    });
+    const mid = scheduler.submit({
+      label: "mid",
+      priority: "PREFETCH",
+      run: async () => "mid"
+    });
+    // Downward/same-level promote is a no-op; upward promote re-sorts.
+    low.promote("CACHE_BUILD"); // lower than BACKGROUND — must be ignored
+    low.promote("VISIBLE_PREVIEW");
+    release();
+    expect(await low.promise).toBe("low"); // promoted above PREFETCH
+    expect(await mid.promise).toBe("mid");
+    // Promoting a RUNNING/settled job is a harmless no-op.
+    low.promote("INTERACTIVE");
+    await blocker.promise;
+  });
+
   it("drops stale jobs instead of delivering results (backpressure §112, §43)", async () => {
     const scheduler = new Scheduler({ maxConcurrent: 1 });
     const onStale = vi.fn();

@@ -25,6 +25,8 @@ export interface SchedulerJob<T> {
     io?: number;
     render?: number;
     nativeProcess?: number;
+    /** Round 10: single-flight admission for the one-threaded XLSX sidecar. */
+    xlsxSidecar?: number;
     estimatedBytes?: number;
   };
   /** Freshness identity checked before start and before result delivery (§43). */
@@ -38,6 +40,12 @@ export interface SchedulerJob<T> {
 export interface ScheduledHandle<T> {
   promise: Promise<T>;
   cancel(): void;
+  /**
+   * Round 10 priority inheritance: move a STILL-QUEUED job to a HIGHER
+   * priority (never lower). No-op once the job is running or done —
+   * consumers joining shared work promote it instead of duplicating it.
+   */
+  promote(priority: SchedulerPriorityName): void;
 }
 
 function resourcesToRequest(
@@ -49,6 +57,7 @@ function resourcesToRequest(
   if (resources.io) classes.io = resources.io;
   if (resources.render) classes.render = resources.render;
   if (resources.nativeProcess) classes["native-process"] = resources.nativeProcess;
+  if (resources.xlsxSidecar) classes["xlsx-sidecar"] = resources.xlsxSidecar;
   return { classes, bytes: resources.estimatedBytes, label: `job:${label}` };
 }
 
@@ -136,6 +145,15 @@ export class Scheduler {
           return;
         }
         queued.abort.abort();
+      },
+      promote: (priority: SchedulerPriorityName) => {
+        const idx = this.queue.indexOf(queued);
+        if (idx < 0) return; // running or settled — promotion is a no-op
+        const nextIndex = PRIORITY_INDEX.get(priority) ?? SCHEDULER_PRIORITIES.length;
+        if (nextIndex >= queued.priorityIndex) return; // only ever upward
+        queued.priorityIndex = nextIndex;
+        this.queue.sort((a, b) => a.priorityIndex - b.priorityIndex || a.enqueueAt - b.enqueueAt);
+        this.pump();
       }
     };
   }

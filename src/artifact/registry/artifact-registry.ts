@@ -21,6 +21,8 @@ import type { ArtifactRef, OfficeFormat } from "../../contracts/ids.js";
 import { fileFingerprint, fingerprintKey } from "../../support/fsx.js";
 import { newId } from "../../support/ids.js";
 import { ByteBudgetCache } from "../cache/byte-budget-cache.js";
+import type { Scheduler } from "../../runtime/scheduler/scheduler.js";
+import type { SchedulerPriorityName } from "../../contracts/scheduler.js";
 
 const CONTEXT_BYTES_ESTIMATE = 8 * 1024; // metadata-level context footprint
 
@@ -30,6 +32,9 @@ interface BuildJob {
   abort: AbortController;
   promise: Promise<ArtifactContext>;
   cancelled: boolean;
+  /** Round 10: scheduler handle for the build — cancel dequeues, promote
+   *  implements priority inheritance for later joiners. */
+  buildHandle?: { cancel(): void; promote(priority: SchedulerPriorityName): void };
 }
 
 export class ArtifactRegistry implements IArtifactRegistry {
@@ -45,6 +50,15 @@ export class ArtifactRegistry implements IArtifactRegistry {
   /** leaseId → { artifactRef, contextKey } for honest holders() introspection. */
   private readonly leaseIndex = new Map<string, { artifactRef: ArtifactRef; contextKey: string }>();
   private readonly inflightConsumersByLease = new Map<string, { key: string; consumer: string }>();
+  /** Round 10: heavy builds (full-profile GenOffice parses) enter the shared
+   *  Scheduler priority ladder + ResourceGovernor admission instead of
+   *  running unregulated; 1 build → N consumers dedup is preserved. */
+  private buildScheduler?: Scheduler;
+
+  /** Service wiring: registry learns the shared scheduler for build admission. */
+  setBuildScheduler(scheduler: Scheduler): void {
+    this.buildScheduler = scheduler;
+  }
 
   registerRuntime(runtime: FormatRuntime, profile: ArtifactContextProfile = "metadata"): void {
     const byProfile = this.runtimes.get(runtime.format) ?? {};
@@ -82,12 +96,33 @@ export class ArtifactRegistry implements IArtifactRegistry {
       // an unguarded delete here would evict the NEW in-flight job (ABA),
       // and a cancelled resolve must never poison the completed cache.
       const self = this;
-      const built: Promise<ArtifactContext> = runtime
-        .createArtifactContext({
+      const runBuild = () =>
+        runtime.createArtifactContext({
           ...input,
           profile,
           signal: abort.signal
-        })
+        });
+      let built: Promise<ArtifactContext>;
+      let buildHandle: BuildJob["buildHandle"];
+      if (this.buildScheduler) {
+        // Round 10 (P1-high): heavy context builds are scheduler/governor
+        // admitted — a background full-profile parse no longer bypasses the
+        // priority ladder. Full parses claim io+cpu; metadata stays light.
+        const handle = this.buildScheduler.submit({
+          label: `artifact-build:${input.artifactRef}:${profile}`,
+          priority: input.priority,
+          resources: profile === "full" ? { io: 1, cpu: 1 } : { io: 1 },
+          run: async (signal) => {
+            if (signal.aborted) throw new DOMException("cancelled", "AbortError");
+            return await runBuild();
+          }
+        });
+        buildHandle = handle;
+        built = handle.promise;
+      } else {
+        built = runBuild();
+      }
+      const settled: Promise<ArtifactContext> = built
         .then(function landed(context) {
           const owner = self.inFlight.get(key);
           if (!job!.cancelled) self.completed.set(key, context);
@@ -99,8 +134,12 @@ export class ArtifactRegistry implements IArtifactRegistry {
           if (owner === job!) self.inFlight.delete(key);
           throw error;
         });
-      job = { key, consumers: new Set(), abort, promise: built, cancelled: false };
+      job = { key, consumers: new Set(), abort, promise: settled, cancelled: false, buildHandle };
       this.inFlight.set(key, job);
+    } else if (job.buildHandle) {
+      // Priority inheritance for joiners: the shared build moves UP to the
+      // newcomer's priority (Scheduler.promote is upward-only).
+      job.buildHandle.promote(input.priority);
     }
 
     const leaseId = newId("lease");
@@ -267,8 +306,11 @@ export class ArtifactRegistry implements IArtifactRegistry {
     if (!job) return;
     job.consumers.delete(leaseId);
     if (job.consumers.size === 0 && !job.cancelled) {
-      // Consumer-aware cancellation (§24): no consumers left → cancel the build.
+      // Consumer-aware cancellation (§24): no consumers left → cancel the
+      // build. A STILL-QUEUED build is dequeued outright (round 10); a
+      // running build stops via its AbortSignal.
       job.cancelled = true;
+      job.buildHandle?.cancel();
       job.abort.abort();
       this.inFlight.delete(entry.key);
     }

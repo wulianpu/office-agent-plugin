@@ -26,7 +26,7 @@ afterAll(async () => {
 async function writeWorkbook(
   name: string,
   sheetXml: string,
-  options: { namespace?: boolean; sheetName?: string; sharedStrings?: string[]; sharedStringsRaw?: string } = {}
+  options: { namespace?: boolean; sheetName?: string; sharedStrings?: string[]; sharedStringsRaw?: string; dimension?: string; extraSheetXml?: string } = {}
 ): Promise<string> {
   const ns = options.namespace === false ? "" : "x:";
   const open = options.namespace === false ? "" : ` xmlns:x="main" xmlns:r="rel"`;
@@ -47,7 +47,7 @@ async function writeWorkbook(
     },
     {
       name: "xl/worksheets/sheet1.xml",
-      data: `<?xml version="1.0"?><${ns}worksheet xmlns:x="main"><${ns}sheetData>${sheetXml}</${ns}sheetData></${ns}worksheet>`
+      data: `<?xml version="1.0"?><${ns}worksheet xmlns:x="main">${options.dimension ? `<dimension ref="${options.dimension}"/>` : ""}<${ns}sheetData>${sheetXml}${options.extraSheetXml ?? ""}</${ns}sheetData></${ns}worksheet>`
     }
   ];
   if (options.sharedStringsRaw) {
@@ -143,6 +143,36 @@ describe("XLSX JS fallback cell scoping (round 8, issue #2)", () => {
     const outline = await renderXlsxOutline(path);
     if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
     expect(outline.sheets[0]!.window[0]).toEqual(["A&B"]);
+  });
+
+  it("rowCount: a declared <dimension> is the exact extent (round 10)", async () => {
+    // 300 physical rows, declared dimension of 10k — the contract must
+    // report the exact 10000, not the early-stopped scan count (~241).
+    const rows = Array.from({ length: 300 }, (_, r) => `<row r="${r + 1}"><c r="A${r + 1}"><v>${r}</v></c></row>`).join("");
+    const path = await writeWorkbook(
+      "rowcount-dimension",
+      "",
+      { namespace: false, dimension: "A1:C10000", extraSheetXml: rows }
+    );
+    const outline = await renderXlsxOutline(path);
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets[0]!.rowCount).toBe(10000);
+    expect(outline.sheets[0]!.rowCountExact).toBe(true);
+    expect(outline.sheets[0]!.window).toHaveLength(60); // window still bounded
+  });
+
+  it("rowCount: without a dimension the scan count is an explicit lower bound (round 10)", async () => {
+    const rows = Array.from({ length: 300 }, (_, r) => `<row r="${r + 1}"><c r="A${r + 1}"><v>${r}</v></c></row>`).join("");
+    const path = await writeWorkbook(
+      "rowcount-lowerbound",
+      "",
+      { namespace: false, extraSheetXml: rows }
+    );
+    const outline = await renderXlsxOutline(path);
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets[0]!.rowCountExact).toBe(false);
+    // A lower bound never under-reports the delivered window.
+    expect(outline.sheets[0]!.rowCount).toBeGreaterThanOrEqual(outline.sheets[0]!.window.length);
   });
 
   it("raw <v> values decode entities too", async () => {

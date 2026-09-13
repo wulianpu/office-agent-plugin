@@ -4,7 +4,7 @@
  * the visible window, never the file size (§31, PERF-13).
  */
 
-import type { PreviewOutline } from "../contracts/preview.js";
+import type { PreviewOutline, PreviewScope } from "../contracts/preview.js";
 import { concatenatedTagTexts, decodeXmlEntities, extractTagTexts, splitRows, splitTagged } from "../support/xml-lite.js";
 import { readZipEntry, readZipIndex, streamZipEntry } from "../artifact/scanner/zip.js";
 
@@ -13,12 +13,15 @@ const XLSX_MAX_ROWS = 60;
 const XLSX_MAX_COLS = 24;
 const PPTX_MAX_SLIDES = 40;
 
-export async function renderDocxOutline(path: string): Promise<PreviewOutline> {
+export async function renderDocxOutline(path: string, scope?: PreviewScope): Promise<PreviewOutline> {
+  const anchor = Math.max(0, Math.floor(scope?.location?.block ?? 0));
+  const maxBlocks = Math.min(DOCX_MAX_BLOCKS, Math.max(1, scope?.maxEntries ?? DOCX_MAX_BLOCKS));
   const index = await readZipIndex(path);
   const blocks: Array<{ index: number; style?: string; text: string }> = [];
   const carry = { pending: "" };
   let carryText = "";
   let done = false;
+  let seen = 0; // absolute paragraph counter (anchor windowing, round 10)
 
   for await (const chunk of streamZipEntry(path, index, "word/document.xml")) {
     const text = chunk.toString("utf8");
@@ -27,7 +30,7 @@ export async function renderDocxOutline(path: string): Promise<PreviewOutline> {
     carryText = "";
     let searchFrom = 0;
     for (;;) {
-      if (blocks.length >= DOCX_MAX_BLOCKS) {
+      if (blocks.length >= maxBlocks) {
         done = true;
         break;
       }
@@ -44,14 +47,14 @@ export async function renderDocxOutline(path: string): Promise<PreviewOutline> {
         break;
       }
       const para = data.slice(openIdx, closeIdx);
-      const texts = extractTagTexts(para, "w:t", { pending: "" });
-      const joined = texts.join("");
-      const styleMatch = para.match(/<w:pStyle w:val="([^"]+)"/);
-      blocks.push({
-        index: blocks.length,
-        style: styleMatch?.[1],
-        text: joined
-      });
+      const absolute = seen++;
+      if (absolute >= anchor) {
+        blocks.push({
+          index: absolute,
+          style: para.match(/<w:pStyle w:val="([^"]+)"/)?.[1],
+          text: extractTagTexts(para, "w:t", { pending: "" }).join("")
+        });
+      }
       searchFrom = closeIdx + 6;
     }
     if (done) break;
@@ -59,9 +62,9 @@ export async function renderDocxOutline(path: string): Promise<PreviewOutline> {
   return { kind: "docx", blocks };
 }
 
-export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
+export async function renderXlsxOutline(path: string, scope?: PreviewScope): Promise<PreviewOutline> {
   const index = await readZipIndex(path);
-  const sheets: Array<{ name: string; rowCount: number; window: string[][] }> = [];
+  const sheets: Array<{ name: string; rowCount: number; rowCountExact?: boolean; window: string[][] }> = [];
 
   const workbookXml = (
     await readZipEntry(path, index, "xl/workbook.xml", 16 * 1024 * 1024).catch(() => Buffer.alloc(0))
@@ -109,8 +112,25 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
       .filter((e): e is [string, string] => Boolean(e))
   );
 
+  // Round 10 scoped windowing: an explicit sheet selects it (falling back to
+  // the leading sheets when unresolvable — a degraded-but-honest default);
+  // range/maxEntries bound the window; maxEntries never lifts the hard caps.
+  const wantedSheet = scope?.location?.sheet;
+  const range = scope?.location?.range;
+  const maxRows = Math.min(
+    XLSX_MAX_ROWS,
+    Math.max(1, scope?.maxEntries ?? (range ? range.toRow - range.fromRow + 1 : XLSX_MAX_ROWS))
+  );
+  const maxCols = range ? Math.min(XLSX_MAX_COLS, range.toCol - range.fromCol + 1) : XLSX_MAX_COLS;
+  const fromRow = range ? Math.max(1, range.fromRow) : 1;
+  const fromCol = range ? Math.max(1, range.fromCol) : 1;
+
+  const ordered = wantedSheet
+    ? [...(sheetTags.find((t) => t.name === wantedSheet) ? [sheetTags.find((t) => t.name === wantedSheet)!] : []), ...sheetTags.filter((t) => t.name !== wantedSheet)]
+    : sheetTags;
+
   let sheetIdx = 0;
-  for (const tag of sheetTags) {
+  for (const tag of ordered) {
     if (sheetIdx >= 4) break; // preview window covers the first sheets
     const name = tag.name;
     const target = relTargets.get(tag.rid);
@@ -121,23 +141,43 @@ export async function renderXlsxOutline(path: string): Promise<PreviewOutline> {
       : `xl/worksheets/sheet${sheetIdx + 1}.xml`;
     const window: string[][] = [];
     let rowCount = 0;
+    // Round 10 rowCount honesty: a declared <dimension ref="A1:C12345"/> is
+    // the EXACT extent; without it the scanned probe count is only a lower
+    // bound (rowCountExact: false) — never presented as a precise total.
+    let declaredRows: number | undefined;
     if (index.entryByName.has(part)) {
       const carry = { pending: "" };
+      let dimensionScan = "";
       for await (const chunk of streamZipEntry(path, index, part)) {
+        if (declaredRows === undefined && dimensionScan.length < 16 * 1024) {
+          dimensionScan += chunk.toString("utf8");
+          const ref = dimensionScan.match(/<(?:[\w.-]+:)?dimension\b[^>]*ref="([A-Z]+\d+):([A-Z]+)(\d+)"/);
+          if (ref) declaredRows = Number(ref[3]);
+        }
         for (const row of splitRows(chunk.toString("utf8"), carry)) {
           rowCount++;
-          if (window.length < XLSX_MAX_ROWS) {
-            window.push(parseRowCells(row, shared));
+          const rowNumber = row.match(/<(?:[\w.-]+:)?row\b[^>]*\br="(\d+)"/)?.[1];
+          const absolute = rowNumber ? Number(rowNumber) : rowCount;
+          if (absolute >= fromRow && window.length < maxRows) {
+            window.push(windowRow(parseRowCells(row, shared), fromCol, maxCols));
           }
           if (rowCount > 500_000) break; // row-count probe cap
         }
-        if (window.length >= XLSX_MAX_ROWS && rowCount > XLSX_MAX_ROWS * 4) break;
+        if (window.length >= maxRows && rowCount > maxRows * 4) break;
       }
     }
-    sheets.push({ name, rowCount, window });
+    const exact = declaredRows !== undefined;
+    const rowCountOut = exact ? Math.max(declaredRows!, rowCount) : rowCount;
+    sheets.push({ name, rowCount: rowCountOut, rowCountExact: exact, window });
     sheetIdx++;
   }
   return { kind: "xlsx", sheets };
+}
+
+/** Slice a parsed row into the scoped column window (1-based, inclusive). */
+function windowRow(cells: string[], fromCol: number, maxCols: number): string[] {
+  if (fromCol <= 1 && maxCols >= cells.length) return cells;
+  return cells.slice(fromCol - 1, fromCol - 1 + maxCols);
 }
 
 function parseRowCells(rowXml: string, shared: string[]): string[] {
@@ -183,15 +223,18 @@ function columnToIndex(letters: string): number {
   return n - 1;
 }
 
-export async function renderPptxOutline(path: string): Promise<PreviewOutline> {
+export async function renderPptxOutline(path: string, scope?: PreviewScope): Promise<PreviewOutline> {
+  // Round 10 scoped windowing: the slide anchor opens the window at the
+  // requested 1-based slide; maxEntries caps it. The hard ceiling stays.
+  const anchor = Math.max(1, Math.floor(scope?.location?.slide ?? 1));
+  const maxSlides = Math.min(PPTX_MAX_SLIDES, Math.max(1, scope?.maxEntries ?? PPTX_MAX_SLIDES));
   const index = await readZipIndex(path);
   const slideEntries = index.entries
     .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.name))
     .sort((a, b) => slideNo(a.name) - slideNo(b.name))
-    .slice(0, PPTX_MAX_SLIDES);
+    .filter((e) => slideNo(e.name) >= anchor && slideNo(e.name) < anchor + maxSlides);
 
   const slides: Array<{ index: number; shapes: Array<{ name?: string; text?: string }> }> = [];
-  let i = 0;
   for (const entry of slideEntries) {
     const xml = (await readZipEntry(path, index, entry.name, 32 * 1024 * 1024).catch(() => Buffer.alloc(0))).toString("utf8");
     const texts = extractTagTexts(xml, "a:t", { pending: "" });
@@ -205,8 +248,8 @@ export async function renderPptxOutline(path: string): Promise<PreviewOutline> {
         text: shapeTexts.join(" ") || undefined
       });
     }
-    slides.push({ index: i + 1, shapes: shapes.length > 0 ? shapes : [{ text: texts.join(" ") || undefined }] });
-    i++;
+    const slideIndex = slideNo(entry.name);
+    slides.push({ index: slideIndex, shapes: shapes.length > 0 ? shapes : [{ text: texts.join(" ") || undefined }] });
   }
   return { kind: "pptx", slides };
 }

@@ -146,6 +146,8 @@ export class OfficeRuntimeService {
     this.store = new ArtifactStore(options.workspaceRoot, this.repos);
     this.scanner = new ArtifactScanner(this.repos);
     this.registry = new ArtifactRegistry();
+    // Round 10: context builds enter the shared priority ladder + governor.
+    this.registry.setBuildScheduler(this.scheduler);
     const resolveByRef = (ref: string) => this.store.resolvePath(ref);
     for (const format of ["docx", "xlsx", "pptx"] as const) {
       const runtime = new BasicFormatRuntime(format);

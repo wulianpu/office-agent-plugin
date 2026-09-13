@@ -139,6 +139,9 @@ export interface PreviewCacheKey {
   rendererVersion: string;
   fontEnvironmentId: string;
   previewProfile: string;
+  /** Round 10: normalized scope key — different windows never share a
+   *  cache entry even for identical content. */
+  scope?: string;
 }
 
 /** §113–§114: binary IPC payload ownership. */

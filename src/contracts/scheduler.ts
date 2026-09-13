@@ -25,6 +25,7 @@ export type ResourceClass =
   | "io"
   | "render"
   | "native-process"
+  | "xlsx-sidecar"
   | "disk-cache";
 
 export interface ResourceRequest {

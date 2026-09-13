@@ -23,6 +23,10 @@ export interface ResourceBudgets {
   ioConcurrent: number;
   renderConcurrent: number;
   nativeProcessConcurrent: number;
+  /** Round 10: the vendored XLSX sidecar executes requests on ONE native
+   *  thread in arrival order — its admission is a dedicated SINGLE-flight
+   *  permit, not the general native-process/io budget. */
+  xlsxSidecarConcurrent: number;
   diskCacheBytes: number;
 }
 
@@ -32,6 +36,7 @@ export const DEFAULT_BUDGETS: ResourceBudgets = {
   ioConcurrent: 4,
   renderConcurrent: 2,
   nativeProcessConcurrent: 4,
+  xlsxSidecarConcurrent: 1,
   diskCacheBytes: 2 * 1024 * 1024 * 1024
 };
 
@@ -43,7 +48,8 @@ const CONCURRENT_CLASSES: Partial<Record<ResourceClass, keyof ResourceBudgets>> 
   cpu: "cpuConcurrent",
   io: "ioConcurrent",
   render: "renderConcurrent",
-  "native-process": "nativeProcessConcurrent"
+  "native-process": "nativeProcessConcurrent",
+  "xlsx-sidecar": "xlsxSidecarConcurrent"
 };
 
 /** Eviction ladder order (§107): lower rank trimmed first. */
@@ -69,7 +75,7 @@ export class ResourceGovernor implements IResourceGovernor {
   private trimming = false;
 
   constructor(readonly budgets: ResourceBudgets = { ...DEFAULT_BUDGETS }) {
-    for (const cls of ["memory", "cpu", "io", "render", "native-process", "disk-cache"] as ResourceClass[]) {
+    for (const cls of ["memory", "cpu", "io", "render", "native-process", "xlsx-sidecar", "disk-cache"] as ResourceClass[]) {
       this.counters.set(cls, { used: 0, protected: 0 });
     }
   }
@@ -180,6 +186,8 @@ export class ResourceGovernor implements IResourceGovernor {
       render: this.counters.get("render")!.used / this.budgets.renderConcurrent,
       "native-process":
         this.counters.get("native-process")!.used / this.budgets.nativeProcessConcurrent,
+      "xlsx-sidecar":
+        this.counters.get("xlsx-sidecar")!.used / this.budgets.xlsxSidecarConcurrent,
       "disk-cache": 0
     };
   }
