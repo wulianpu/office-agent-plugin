@@ -42,16 +42,17 @@ const ws = process.argv[2];
 const mode = process.argv[3]; // "committed" | "crash-prepared" | "crash-source-replaced"
 const plugin = await OfficePlugin.create({ workspaceRoot: path.join(ws, "rt"), skipHostProbe: true });
 
-// Create a real docx source file
-const { execFile } = await import("node:child_process");
-const { promisify } = await import("node:util");
-const exec = promisify(execFile);
+// Create a real docx source file. The adapter (not a raw execFile) resolves
+// the npm .cmd shim to its JS entry — a bare spawn of "officecli" fails with
+// ENOENT on Windows where the global install only provides the shim.
+const { OfficeCliAdapter } = await import((await import("node:url")).pathToFileURL(process.cwd() + "/dist/agent/officecli/officecli-adapter.js").href);
+const adapter = new OfficeCliAdapter({ timeoutMs: 90_000 });
 const srcPath = path.join(ws, "source.docx");
-await exec("officecli", ["create", srcPath, "--json"]).catch(() => undefined);
-await exec("officecli", ["batch", srcPath, "--commands", JSON.stringify([
+await adapter.run(["create", srcPath, "--json"]).catch(() => undefined);
+await adapter.runBatchStandalone(srcPath, [
   { command: "add", parent: "/body", type: "paragraph", props: { text: "Restart test content" } }
-]), "--json"]);
-await exec("officecli", ["close", srcPath, "--json"]);
+]);
+await adapter.close(srcPath);
 
 const ref = await plugin.registerArtifact(srcPath);
 const session = await plugin.openSession(ref);
