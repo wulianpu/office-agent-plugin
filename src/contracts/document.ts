@@ -100,7 +100,8 @@ export type SessionErrorCode =
   | "policy-denied"
   | "idempotency-conflict"
   | "scope-violation"
-  | "invalid-scope";
+  | "invalid-scope"
+  | "candidate-hash-mismatch";
 
 export class OfficeRuntimeError extends Error {
   constructor(

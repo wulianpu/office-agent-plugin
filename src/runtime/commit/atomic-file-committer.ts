@@ -124,6 +124,49 @@ export class AtomicFileCommitter {
     await fsyncFile(tempPath);
     await this.journal(record, "temp-ready");
 
+    // ── P0 candidate seal (#5): the bytes about to be renamed must BE the
+    // verification-bound hash, verified BEFORE the destructive replace. The
+    // sibling temp is this commit's own fsynced copy, so its hash is stable;
+    // a mismatch (staging changed after verification, wrong call path) must
+    // fail here — previously the unverified bytes were renamed onto the
+    // source FIRST and only discovered by the post-replace rehash, after
+    // the old source content was already lost.
+    const tempHash = await sha256File(tempPath);
+    if (tempHash !== request.candidateHash) {
+      await this.cleanupTemp(record);
+      await this.journal(record, "aborted");
+      throw new OfficeRuntimeError(
+        "candidate-hash-mismatch",
+        `candidate seal failed: temp holds ${tempHash}, verification bound ${request.candidateHash}`
+      );
+    }
+
+    // ── P0 source seal (#5): the authoritative INV-10 check moves to the
+    // last gate before the replace. The early check above can pass and an
+    // external Word/WPS/sync save can still land inside the copy + fsync +
+    // journal window; that external version must survive untouched instead
+    // of being silently overwritten by the rename. (A residual OS-level
+    // race between this check and the rename syscall remains — no
+    // cross-platform hash-CAS-rename primitive exists — but the large
+    // window is closed.)
+    const finalSourceHash = await sha256File(request.sourcePath).catch(() => undefined);
+    if (finalSourceHash === undefined) {
+      await this.cleanupTemp(record);
+      await this.journal(record, "aborted");
+      throw new OfficeRuntimeError(
+        "artifact-missing",
+        `source vanished before replace: ${request.sourcePath}`
+      );
+    }
+    if (finalSourceHash !== request.expectedSourceHash) {
+      await this.cleanupTemp(record);
+      await this.journal(record, "aborted");
+      throw new OfficeRuntimeError(
+        "source-mutated",
+        `source changed during commit (pre-replace seal): expected ${request.expectedSourceHash}, found ${finalSourceHash} — external bytes preserved`
+      );
+    }
+
     await this.replaceAtomically(tempPath, request.sourcePath);
     await fsyncFile(request.sourcePath);
     // P1 hardening: POSIX parent-dir fsync makes the rename durable across
@@ -133,12 +176,17 @@ export class AtomicFileCommitter {
     await fsyncParentDir(request.sourcePath);
     await this.journal(record, "source-replaced");
 
-    // Rehash the replaced source; must equal the candidate bytes.
+    // Final durability/integrity assertion — NOT the first line of defense
+    // (the pre-replace seals are). A mismatch here means a filesystem
+    // anomaly or a last-instant external write raced the rename: surface it
+    // as recovery-required (the journal sits at SOURCE_REPLACED with hash
+    // facts recorded; Recovery resolves the conflict), never as a plain
+    // retryable io-error.
     const replacedHash = await sha256File(request.sourcePath);
     if (replacedHash !== request.candidateHash) {
       throw new OfficeRuntimeError(
-        "io-error",
-        `post-replace hash mismatch: ${replacedHash} != ${request.candidateHash}`
+        "recovery-required",
+        `post-replace hash mismatch: ${replacedHash} != ${request.candidateHash} — recovery required`
       );
     }
 
