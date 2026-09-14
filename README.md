@@ -134,3 +134,9 @@ await plugin.acceptCandidate(session.sessionId);  // §75 原子提交 → 修�
 定时修复自动化）一律走 **branch → PR → `linux` + `windows` required
 checks 全绿 → merge**；直接 push、force-push 与分支删除均被平台拒绝，
 无任何 bypass 身份。临时 break-glass 需另行创建专用身份并显式授权。
+
+### Status provenance
+
+`linux` / `windows` 两个 required check 均绑定 GitHub Actions 作为唯一
+expected source（ruleset `integration_id`）——任何其他 actor/integration
+写入的同名 success status 不满足合并门。
