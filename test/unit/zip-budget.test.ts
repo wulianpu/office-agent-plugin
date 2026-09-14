@@ -110,6 +110,70 @@ describe("untrusted ZIP resource boundaries (issue #7)", () => {
     await expect(readZipIndex(path, tinyCd)).rejects.toThrow(/central directory exceeds budget/);
   });
 
+  it("stored entries: declared size << compressedSize fails BEFORE the big allocation (issue #7 reopen)", async () => {
+    // method=0 with lying metadata: size=1KiB, compressedSize=8MiB. The
+    // caller's 64KiB cap must reject it before Buffer.alloc(8MiB) semantics
+    // matter — and the metadata mismatch itself is grounds to refuse.
+    const payload = Buffer.alloc(8 * 1024 * 1024, 0x43);
+    const zip = craftZip([{ name: "stored-lie.xml", method: 0, data: payload, declaredSize: 1024 }]);
+    const path = join(dir, "stored-lie.docx");
+    await writeFile(path, zip);
+    const index = await readZipIndex(path);
+    await expect(readZipEntry(path, index, "stored-lie.xml", 64 * 1024)).rejects.toThrow(
+      /stored entry metadata mismatch/
+    );
+  });
+
+  it("stored entries: honest large payloads still respect the caller cap", async () => {
+    const payload = Buffer.alloc(256 * 1024, 0x44); // honest: size == compressedSize
+    const zip = craftZip([{ name: "stored-big.xml", method: 0, data: payload }]);
+    const path = join(dir, "stored-big.docx");
+    await writeFile(path, zip);
+    const index = await readZipIndex(path);
+    await expect(readZipEntry(path, index, "stored-big.xml", 64 * 1024)).rejects.toThrow(
+      /entry too large|stored entry exceeds budget/
+    );
+    const ok = await readZipEntry(path, index, "stored-big.xml", 1024 * 1024);
+    expect(ok.length).toBe(256 * 1024);
+  });
+
+  it("per-entry ZIP64 extras with unsafe values are rejected before allocation/seek (issue #7 reopen)", async () => {
+    // Build a ZIP whose single entry carries a malicious 0x0001 extra with
+    // size sentinel + a >MAX_SAFE_INTEGER value.
+    const data = Buffer.from("zip64-lies");
+    const nameBuf = Buffer.from("z64.xml", "utf8");
+    const extra = Buffer.alloc(32); // header 0x0001, dataSize 24: size(8)+csize(8)+offset(8)
+    extra.writeUInt16LE(0x0001, 0);
+    extra.writeUInt16LE(24, 2);
+    extra.writeBigUInt64LE(BigInt("0xffffffffffffffff"), 4); // size sentinel replaced with huge
+    extra.writeBigUInt64LE(BigInt(10), 12); // compressedSize
+    extra.writeBigUInt64LE(BigInt(0), 20); // offset
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0);
+    lfh.writeUInt16LE(0, 8);
+    lfh.writeUInt32LE(data.length, 18);
+    lfh.writeUInt32LE(data.length, 22);
+    lfh.writeUInt16LE(nameBuf.length, 26);
+    const cde = Buffer.alloc(46);
+    cde.writeUInt32LE(0x02014b50, 0);
+    cde.writeUInt32LE(0xffffffff, 24); // size sentinel -> ZIP64 extra
+    cde.writeUInt32LE(data.length, 20);
+    cde.writeUInt16LE(nameBuf.length, 28);
+    cde.writeUInt16LE(extra.length, 30); // extraLen
+    cde.writeUInt32LE(0, 42);
+    const cd = Buffer.concat([cde, nameBuf, extra]);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(1, 8);
+    eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(30 + nameBuf.length + data.length, 16);
+    const zip = Buffer.concat([lfh, nameBuf, data, cd, eocd]);
+    const path = join(dir, "z64-lie.docx");
+    await writeFile(path, zip);
+    await expect(readZipIndex(path)).rejects.toThrow(/ZIP64 entry size/);
+  });
+
   it("normal fixtures do not regress (buffered + streaming + ZIP64-safe)", async () => {
     const zip = buildZip([
       { name: "[Content_Types].xml", data: "<?xml version=\"1.0\"?><Types/>" },

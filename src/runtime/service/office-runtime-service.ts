@@ -416,7 +416,7 @@ export class OfficeRuntimeService {
       `editor:${sessionId}`,
       this.editorProfileFor(plugin)
     );
-    let editor: EditorInstance;
+    let editor: EditorInstance | undefined;
     try {
       editor = await this.editorHost.mount(plugin, {
         sessionId,
@@ -426,41 +426,77 @@ export class OfficeRuntimeService {
       });
       await editor.activateEdit();
     } catch (error) {
+      // P1-high (#8 reopen): the instance may already be created+mounted
+      // when activateEdit fails — dispose it, never leak host resources.
+      await editor?.dispose().catch(() => undefined);
       artifactLease.release();
       throw error;
     }
 
-    const result = await promoteToEdit(
-      {
-        store: this.store,
-        scanner: this.scanner,
-        repos: this.repos,
-        sessions: this.sessions,
-        leases: this.leases,
-        candidates: this.candidates,
-        events: this.events,
-        scheduler: this.scheduler
-      },
-      sessionId,
-      bookmark
-    ).catch(async (error: unknown) => {
-      // Compensation: the writer commit point failed after the editor was
-      // prepared — release the prepared resources with a symmetric audit
-      // trail and no half-bound session state.
+    /** P1-high (#8 reopen): ONE compensation for EVERY post-prepare failure
+     *  (writer commit OR the post-lease session-binding persistence) —
+     *  release the human lease, clear the binding, symmetric durable
+     *  lease.released, dispose the editor, drop the ArtifactLease. */
+    const compensatePostLease = async (reason: string): Promise<void> => {
+      const lease = this.leases.activeLease(sessionId);
+      if (lease && lease.owner === "human") {
+        this.leases.release(lease.leaseId);
+      }
+      this.sessions.updateSession(sessionId, (s) => {
+        if (s.writerLease?.owner === "human") s.writerLease = undefined;
+        s.editor = undefined;
+      });
+      await this.events
+        .emit(
+          sessionId,
+          this.sessions.get(sessionId)?.sessionEpoch ?? 1,
+          "lease.released",
+          { leaseId: lease?.leaseId, owner: "human", reason }
+        )
+        .catch(() => undefined);
+      await editor?.dispose().catch(() => undefined);
       artifactLease.release();
-      await editor.dispose().catch(() => undefined);
-      throw error;
-    });
+      this.editorInstances.delete(sessionId);
+      this.editorArtifactLeases.delete(sessionId);
+    };
 
-    this.sessions.updateSession(sessionId, (s) => {
-      s.editor = {
-        instanceId: editor.instanceId,
-        plugin,
-        host: this.editorHost,
-        boundAt: Date.now(),
-        artifactLease
-      };
-    });
+    let result;
+    try {
+      result = await promoteToEdit(
+        {
+          store: this.store,
+          scanner: this.scanner,
+          repos: this.repos,
+          sessions: this.sessions,
+          leases: this.leases,
+          candidates: this.candidates,
+          events: this.events,
+          scheduler: this.scheduler
+        },
+        sessionId,
+        bookmark
+      );
+    } catch (error) {
+      await compensatePostLease("promotion-failed");
+      throw error;
+    }
+
+    try {
+      this.sessions.updateSession(sessionId, (s) => {
+        s.editor = {
+          instanceId: editor!.instanceId,
+          plugin,
+          host: this.editorHost,
+          boundAt: Date.now(),
+          artifactLease
+        };
+      });
+    } catch (error) {
+      // The binding persistence failed AFTER the lease commit — full
+      // compensation, never a half-bound writer state.
+      await compensatePostLease("promotion-failed");
+      throw error;
+    }
     this.editorInstances.set(sessionId, editor);
     this.editorArtifactLeases.set(sessionId, artifactLease);
     return { lease: result.lease, editor };

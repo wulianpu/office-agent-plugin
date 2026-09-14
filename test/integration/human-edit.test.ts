@@ -141,6 +141,70 @@ describe("Human edit path (§12–§13)", () => {
     await ws.plugin.closeSession(session.sessionId);
   });
 
+  it("P1-high (#8 reopen): activateEdit failure disposes the mounted editor; binding-persistence failure compensates the human lease", async () => {
+    const ref = await ws.plugin.registerArtifact(docxPath);
+    const session = await ws.plugin.openSession(ref);
+    await ws.plugin.service.sessions.ensureStrongIdentity(session.sessionId);
+
+    // ── Case 1: a plugin whose activateEdit throws ──
+    const originalPlugin = ws.plugin.service.editorHost.pluginFor("docx");
+    const failing = {
+      ...originalPlugin!,
+      async create(context: never) {
+        const instance = await originalPlugin!.create(context);
+        const wrapped = Object.create(instance) as typeof instance & { disposed?: boolean };
+        wrapped.activateEdit = async () => {
+          throw new Error("engine activation exploded");
+        };
+        return wrapped;
+      }
+    };
+    ws.plugin.service.editorHost.register(failing as never);
+    try {
+      await expect(ws.plugin.beginEdit(session.sessionId)).rejects.toThrow("engine activation exploded");
+    } finally {
+      ws.plugin.service.editorHost.register(originalPlugin!);
+    }
+    // Zero residue: no human lease, no editor binding, no editor ArtifactLease.
+    expect(ws.plugin.service.leases.activeLease(session.sessionId)).toBeUndefined();
+    expect(ws.plugin.service.getSession(session.sessionId)?.editor).toBeUndefined();
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0);
+
+    // ── Case 2: post-lease session-binding persistence failure ──
+    const repos = ws.plugin.service.repos as unknown as {
+      upsertSession: (row: unknown) => void;
+    };
+    const originalUpsert = repos.upsertSession.bind(repos);
+    let failNextBinding = false;
+    repos.upsertSession = (row: unknown) => {
+      const r = row as { lifecycle?: string };
+      // Fail only the editor-binding write (lifecycle ready + after lease).
+      if (failNextBinding && r.lifecycle === "ready") {
+        failNextBinding = false;
+        throw new Error("session persistence fault");
+      }
+      return originalUpsert(row);
+    };
+    failNextBinding = true;
+    try {
+      await expect(ws.plugin.beginEdit(session.sessionId)).rejects.toThrow("session persistence fault");
+    } finally {
+      repos.upsertSession = originalUpsert;
+    }
+    // Full compensation: human lease released, writerLease/editor cleared,
+    // durable lease.released(reason=promotion-failed) recorded.
+    expect(ws.plugin.service.leases.activeLease(session.sessionId)).toBeUndefined();
+    const live = ws.plugin.service.getSession(session.sessionId);
+    expect(live?.writerLease).toBeUndefined();
+    expect(live?.editor).toBeUndefined();
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0);
+    const events = ws.plugin.service.repos.readEventsSince(session.sessionId, 0n, 100);
+    const released = [...events].reverse().find((e) => e.type === "lease.released");
+    expect((released?.payload as { reason?: string })?.reason).toBe("promotion-failed");
+
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
   it("the editor contract lifecycle holds (mount/save/suspend/resume/dispose)", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
     const session = await ws.plugin.openSession(ref);

@@ -147,15 +147,24 @@ export async function readZipIndex(
         if (headerId === 0x0001) {
           let f = extraPos + 4;
           if (size === 0xffffffff && f + 8 <= extraPos + 4 + dataSize) {
-            size = Number(cd.readBigUInt64LE(f));
+            // P1 (#7 reopen): per-entry ZIP64 values are attacker metadata
+            // too — precision loss or negatives must fail before any
+            // allocation/seek uses them.
+            size = safeNonNegativeInt(Number(cd.readBigUInt64LE(f)), "ZIP64 entry size");
             f += 8;
           }
           if (compressedSize === 0xffffffff && f + 8 <= extraPos + 4 + dataSize) {
-            compressedSize = Number(cd.readBigUInt64LE(f));
+            compressedSize = safeNonNegativeInt(
+              Number(cd.readBigUInt64LE(f)),
+              "ZIP64 entry compressedSize"
+            );
             f += 8;
           }
           if (localHeaderOffset === 0xffffffff && f + 8 <= extraPos + 4 + dataSize) {
-            localHeaderOffset = Number(cd.readBigUInt64LE(f));
+            localHeaderOffset = safeNonNegativeInt(
+              Number(cd.readBigUInt64LE(f)),
+              "ZIP64 entry localHeaderOffset"
+            );
           }
           break;
         }
@@ -211,8 +220,29 @@ export async function readZipEntry(
         `compressed entry exceeds budget: ${name} (${entry.compressedSize})`
       );
     }
+    // P1-high (#7 reopen): a STORED entry's metadata must be self-consistent
+    // and bounded by the CALLER's cap before any allocation — declaring
+    // size=1KiB with compressedSize=200MiB must not allocate 200MiB just
+    // because it fits the archive-wide compressed budget.
+    if (entry.method === 0) {
+      if (entry.compressedSize !== entry.size) {
+        throw new ZipFormatError(
+          `stored entry metadata mismatch: ${name} (size ${entry.size} != compressedSize ${entry.compressedSize})`
+        );
+      }
+      if (entry.compressedSize > maxBytes || entry.compressedSize > budget.maxUncompressedEntryBytes) {
+        throw new ZipFormatError(
+          `stored entry exceeds budget: ${name} (${entry.compressedSize} > min(${maxBytes}, ${budget.maxUncompressedEntryBytes}))`
+        );
+      }
+    }
     const raw = Buffer.alloc(entry.compressedSize);
-    await handle.read(raw, 0, entry.compressedSize, BigInt(dataOffset));
+    const { bytesRead } = await handle.read(raw, 0, entry.compressedSize, BigInt(dataOffset));
+    if (bytesRead !== entry.compressedSize) {
+      throw new ZipFormatError(
+        `stored entry short read: ${name} (expected ${entry.compressedSize}, got ${bytesRead})`
+      );
+    }
     if (entry.method === 0) return raw;
     if (entry.method === 8) {
       // P1-high (#7): the DECLARED size is metadata — actual inflate output
@@ -262,10 +292,17 @@ export async function* streamZipEntry(
     const extraLen = lfh.readUInt16LE(28);
     const dataOffset = entry.localHeaderOffset + 30 + nameLen + extraLen;
 
+    // P1 (#7 reopen): the compressed-payload budget applies to BOTH read
+    // paths before any payload IO begins.
+    if (entry.compressedSize > budget.maxCompressedEntryBytes) {
+      throw new ZipFormatError(
+        `compressed entry exceeds budget: ${name} (${entry.compressedSize})`
+      );
+    }
     if (entry.method === 0) {
-      if (entry.compressedSize > budget.maxUncompressedEntryBytes) {
+      if (entry.compressedSize !== entry.size || entry.compressedSize > budget.maxUncompressedEntryBytes) {
         throw new ZipFormatError(
-          `stored entry exceeds budget: ${name} (${entry.compressedSize})`
+          `stored entry metadata/budget violation: ${name} (size ${entry.size}, compressedSize ${entry.compressedSize})`
         );
       }
       let position = dataOffset;
