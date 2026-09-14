@@ -135,14 +135,33 @@ export async function promoteToEdit(
       baseRevisionId: live.committedRevision.revisionId,
       sourcePath
     });
-    await deps.events.emit(sessionId, live.sessionEpoch, "lease.acquired", {
-      leaseId: lease.leaseId,
-      owner: "human",
-      fencingToken: lease.fencingToken.toString()
-    });
-    deps.sessions.updateSession(sessionId, (s) => {
-      s.writerLease = lease;
-    });
+    // P1-high (#8 reopen #3): anything failing AFTER the acquire is rolled
+    // back HERE — promoteToEdit either returns a fully-bound writer or
+    // throws with ZERO lease residue; callers can safely treat a rejection
+    // as "this invocation owns no writer" (never a leaked live lease).
+    try {
+      await deps.events.emit(sessionId, live.sessionEpoch, "lease.acquired", {
+        leaseId: lease.leaseId,
+        owner: "human",
+        fencingToken: lease.fencingToken.toString()
+      });
+      deps.sessions.updateSession(sessionId, (s) => {
+        s.writerLease = lease;
+      });
+    } catch (error) {
+      deps.leases.release(lease.leaseId);
+      deps.sessions.updateSession(sessionId, (s) => {
+        if (s.writerLease?.leaseId === lease.leaseId) s.writerLease = undefined;
+      });
+      await deps.events
+        .emit(sessionId, live.sessionEpoch, "lease.released", {
+          leaseId: lease.leaseId,
+          owner: "human",
+          reason: "promotion-failed"
+        })
+        .catch(() => undefined);
+      throw error;
+    }
     return { lease, bookmark };
   });
 }

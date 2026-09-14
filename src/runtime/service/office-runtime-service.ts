@@ -121,6 +121,12 @@ export class OfficeRuntimeService {
   wpsProbePromise?: Promise<boolean>;
   private disposed = false;
   private readonly editorInstances = new Map<string, EditorInstance>();
+  /**
+   * P1-high (#8 reopen #3): per-session edit-promotion single-flight —
+   * concurrent first-edit callers join the winner instead of racing; a
+   * failed invocation can never unwind a sibling's committed writer.
+   */
+  private readonly editPromotions = new Map<string, Promise<{ lease: WriterLease; editor: EditorInstance }>>();
   /** ArtifactLeases pinned by live editors — released in endEdit/dispose (P0-2). */
   private readonly editorArtifactLeases = new Map<string, ArtifactLease>();
   /** §11/P11 global: source replacements serialize per physical path, even across sessions. */
@@ -401,16 +407,45 @@ export class OfficeRuntimeService {
   }
 
   async beginEdit(sessionId: string, bookmark?: ViewBookmark): Promise<{ lease: WriterLease; editor: EditorInstance }> {
+    // P1-high (#8 reopen #3): already-editing sessions fail CLOSED with
+    // zero new resources and zero state change — the existing human writer,
+    // editor binding and ownership maps are untouched (INV-02 semantics).
+    const activeLease = this.leases.activeLease(sessionId);
+    const boundEditor = this.editorInstances.get(sessionId);
+    if (boundEditor && activeLease?.owner === "human" && this.sessions.get(sessionId)?.editor) {
+      throw new OfficeRuntimeError(
+        "lease-held",
+        `session ${sessionId} is already editing (lease ${activeLease.leaseId}, editor ${boundEditor.instanceId})`
+      );
+    }
+
+    // Single-flight: concurrent first-edit callers join the in-flight
+    // promotion instead of preparing competing editors/leases.
+    const inFlight = this.editPromotions.get(sessionId);
+    if (inFlight) return inFlight;
+
+    const promotion = this.runBeginEdit(sessionId, bookmark);
+    this.editPromotions.set(sessionId, promotion);
+    try {
+      return await promotion;
+    } finally {
+      this.editPromotions.delete(sessionId);
+    }
+  }
+
+  private async runBeginEdit(
+    sessionId: string,
+    bookmark?: ViewBookmark
+  ): Promise<{ lease: WriterLease; editor: EditorInstance }> {
     const session = this.sessions.require(sessionId);
     const plugin: OfficeEditorPlugin | undefined = this.editorHost.pluginFor(session.format);
     if (!plugin) {
       throw new OfficeRuntimeError("unsupported-format", `no editor plugin for ${session.format}`);
     }
 
-    // P1-high (#8): PREPARE all editor resources BEFORE taking the human
-    // lease — plugin lookup, context build, mount and activation all
-    // precede the writer commit point, so any failure leaves zero writer
-    // state instead of "lease held, no editor".
+    // PREPARE all editor resources BEFORE taking the human lease — plugin
+    // lookup, context build, mount and activation all precede the writer
+    // commit point, so any failure here leaves zero writer state.
     const artifactLease = await this.acquireArtifactLease(
       session.artifactRef,
       `editor:${sessionId}`,
@@ -426,38 +461,43 @@ export class OfficeRuntimeService {
       });
       await editor.activateEdit();
     } catch (error) {
-      // P1-high (#8 reopen): the instance may already be created+mounted
-      // when activateEdit fails — dispose it, never leak host resources.
+      // The instance may already be created+mounted when activateEdit
+      // fails — dispose it, never leak host resources.
       await editor?.dispose().catch(() => undefined);
       artifactLease.release();
       throw error;
     }
 
-    /** P1-high (#8 reopen): ONE compensation for EVERY post-prepare failure
-     *  (writer commit OR the post-lease session-binding persistence) —
-     *  release the human lease, clear the binding, symmetric durable
-     *  lease.released, dispose the editor, drop the ArtifactLease. */
-    const compensatePostLease = async (reason: string): Promise<void> => {
-      const lease = this.leases.activeLease(sessionId);
-      if (lease && lease.owner === "human") {
-        this.leases.release(lease.leaseId);
+    /**
+     * INVOCATION-SCOPED compensation (P1-high #8 reopen #3): rollback only
+     * what THIS invocation owns — the lease promoteToEdit returned to us,
+     * the editor/ArtifactLease we created. A pre-lease failure (this call
+     * never acquired a writer) must not touch the session's live lease,
+     * binding or ownership maps: they may belong to a concurrent winner.
+     */
+    const compensateOwnedLease = async (ownedLease: WriterLease): Promise<void> => {
+      // Identity guard: only release if OUR lease is still the active one.
+      if (this.leases.activeLease(sessionId)?.leaseId === ownedLease.leaseId) {
+        this.leases.release(ownedLease.leaseId);
       }
       this.sessions.updateSession(sessionId, (s) => {
-        if (s.writerLease?.owner === "human") s.writerLease = undefined;
+        if (s.writerLease?.leaseId === ownedLease.leaseId) s.writerLease = undefined;
         s.editor = undefined;
       });
       await this.events
         .emit(
           sessionId,
-          this.sessions.get(sessionId)?.sessionEpoch ?? 1,
+          this.sessions.get(sessionId)?.sessionEpoch ?? ownedLease.sessionEpoch,
           "lease.released",
-          { leaseId: lease?.leaseId, owner: "human", reason }
+          { leaseId: ownedLease.leaseId, owner: "human", reason: "promotion-failed" }
         )
         .catch(() => undefined);
       await editor?.dispose().catch(() => undefined);
       artifactLease.release();
-      this.editorInstances.delete(sessionId);
-      this.editorArtifactLeases.delete(sessionId);
+      if (this.editorInstances.get(sessionId) === editor) this.editorInstances.delete(sessionId);
+      if (this.editorArtifactLeases.get(sessionId) === artifactLease) {
+        this.editorArtifactLeases.delete(sessionId);
+      }
     };
 
     let result;
@@ -477,7 +517,10 @@ export class OfficeRuntimeService {
         bookmark
       );
     } catch (error) {
-      await compensatePostLease("promotion-failed");
+      // PRE-LEASE failure: this invocation owns NO writer — clean only the
+      // prepared editor/context; never sweep the session's live state.
+      await editor!.dispose().catch(() => undefined);
+      artifactLease.release();
       throw error;
     }
 
@@ -492,9 +535,9 @@ export class OfficeRuntimeService {
         };
       });
     } catch (error) {
-      // The binding persistence failed AFTER the lease commit — full
-      // compensation, never a half-bound writer state.
-      await compensatePostLease("promotion-failed");
+      // The binding persistence failed AFTER our lease commit — release
+      // exactly OUR lease and binding, never a sibling's.
+      await compensateOwnedLease(result.lease);
       throw error;
     }
     this.editorInstances.set(sessionId, editor);

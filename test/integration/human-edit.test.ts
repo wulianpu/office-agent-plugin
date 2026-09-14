@@ -205,6 +205,88 @@ describe("Human edit path (§12–§13)", () => {
     await ws.plugin.closeSession(session.sessionId);
   });
 
+  it("P1-high (#8 reopen #3): re-entrant and CONCURRENT beginEdit are ownership-safe — the winner's writer is never unwound", async () => {
+    const ref = await ws.plugin.registerArtifact(docxPath);
+    const session = await ws.plugin.openSession(ref);
+    await ws.plugin.service.sessions.ensureStrongIdentity(session.sessionId);
+
+    // ── Concurrent first-edit: both callers join the single-flight ──
+    const [a, b] = await Promise.all([
+      ws.plugin.beginEdit(session.sessionId, { location: { block: 0 } }),
+      ws.plugin.beginEdit(session.sessionId, { location: { block: 1 } })
+    ]);
+    // Exactly one human writer lease; both see the SAME editor instance.
+    expect(a.editor.instanceId).toBe(b.editor.instanceId);
+    expect(a.lease.leaseId).toBe(b.lease.leaseId);
+    const active = ws.plugin.service.leases.activeLease(session.sessionId)!;
+    expect(active.owner).toBe("human");
+    expect(active.leaseId).toBe(a.lease.leaseId);
+    // The winner's fencing still validates after the race.
+    ws.plugin.service.leases.validate(active, active.fencingToken);
+    // One editor + one editor ArtifactLease — not two of each.
+    expect(ws.plugin.service.editorLeaseCount()).toBe(1);
+
+    // ── Re-entrant second call: fail-closed lease-held, zero state change ──
+    const leaseCountBefore = ws.plugin.service.registry.leaseCount();
+    await expect(ws.plugin.beginEdit(session.sessionId)).rejects.toMatchObject({ code: "lease-held" });
+    expect(ws.plugin.service.registry.leaseCount()).toBe(leaseCountBefore);
+    expect(ws.plugin.service.leases.activeLease(session.sessionId)?.leaseId).toBe(a.lease.leaseId);
+    expect(ws.plugin.service.getSession(session.sessionId)?.editor?.instanceId).toBe(a.editor.instanceId);
+
+    // ── The winner still passes the Runtime save gate after the races ──
+    const saved = await ws.plugin.humanSave(session.sessionId);
+    expect(saved.unchanged).toBe(true);
+
+    // ── endEdit recovers everything to baseline precisely ──
+    await ws.plugin.endEdit(session.sessionId);
+    expect(ws.plugin.service.leases.activeLease(session.sessionId)).toBeUndefined();
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0);
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
+  it("P1-high (#8 reopen #3): a promotion failing at the writer gate leaves zero writer state — and a live winner elsewhere is unaffected", async () => {
+    // ── Fresh session A: promotion fails INSIDE promoteToEdit (candidate
+    // gate) after its own editor prepare — pre-lease failure must leave
+    // zero writer/binding/ownership residue. ──
+    const refA = await ws.plugin.registerArtifact(docxPath);
+    const sessionA = await ws.plugin.openSession(refA);
+    await ws.plugin.service.sessions.ensureStrongIdentity(sessionA.sessionId);
+    const task = await ws.plugin.beginAgentTask(sessionA.sessionId, {
+      intent: "block loser promotion",
+      destructiveAllowed: false
+    });
+    await expect(ws.plugin.beginEdit(sessionA.sessionId)).rejects.toMatchObject({
+      code: "candidate-conflict"
+    });
+    // Pre-lease failure: no HUMAN writer was taken; the AGENT task's own
+    // lease survives untouched; no editor binding or editor ArtifactLease.
+    expect(ws.plugin.service.leases.activeLease(sessionA.sessionId)?.owner).toBe("agent");
+    expect(ws.plugin.service.getSession(sessionA.sessionId)?.editor).toBeUndefined();
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0);
+    await ws.plugin.finalizeAgentTask(task);
+    await ws.plugin.rejectCandidate(sessionA.sessionId);
+    expect(ws.plugin.service.leases.activeLease(sessionA.sessionId)).toBeUndefined();
+
+    // ── Session B: a LIVE winner — with the single-flight in place, any
+    // later beginEdit on B is idempotent: same leaseId, same editor, zero
+    // new resources; the winner's writer is never unwound by another call. ──
+    const refB = await ws.plugin.registerArtifact(docxPath);
+    const sessionB = await ws.plugin.openSession(refB);
+    await ws.plugin.service.sessions.ensureStrongIdentity(sessionB.sessionId);
+    const winner = await ws.plugin.beginEdit(sessionB.sessionId);
+    const winnerLeaseId = winner.lease.leaseId;
+    const leaseCountWithEditor = ws.plugin.service.registry.leaseCount();
+    await expect(ws.plugin.beginEdit(sessionB.sessionId)).rejects.toMatchObject({ code: "lease-held" });
+    expect(ws.plugin.service.leases.activeLease(sessionB.sessionId)?.leaseId).toBe(winnerLeaseId);
+    expect(ws.plugin.service.getSession(sessionB.sessionId)?.editor?.instanceId).toBe(winner.editor.instanceId);
+    expect(ws.plugin.service.registry.leaseCount()).toBe(leaseCountWithEditor);
+    ws.plugin.service.leases.validate(winner.lease, winner.lease.fencingToken);
+
+    await ws.plugin.closeSession(sessionA.sessionId);
+    await ws.plugin.closeSession(sessionB.sessionId);
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0);
+  });
+
   it("the editor contract lifecycle holds (mount/save/suspend/resume/dispose)", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
     const session = await ws.plugin.openSession(ref);
