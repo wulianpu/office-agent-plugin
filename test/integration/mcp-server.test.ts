@@ -120,7 +120,11 @@ describe("MCP stdio server (wire protocol)", () => {
     const originalGet = ws.plugin.mcpTools["service"].officecli.get.bind(
       ws.plugin.mcpTools["service"].officecli
     );
+    const originalEngine = ws.plugin.service.isEngineAvailable.bind(ws.plugin.service);
     const session = await ws.plugin.openSession(ref);
+    // Linux CI has no engine: bypass the availability gate so the mocked
+    // adapter error (with the physical path) is what reaches the wire.
+    ws.plugin.service.isEngineAvailable = () => true;
     ws.plugin.mcpTools["service"].officecli.get = async () => {
       throw Object.assign(
         new Error(`officecli timed out: officecli node get ${realPath} /body --json`),
@@ -143,6 +147,7 @@ describe("MCP stdio server (wire protocol)", () => {
       expect(text).toContain("timed out"); // the typed reason survives
     } finally {
       ws.plugin.mcpTools["service"].officecli.get = originalGet;
+      ws.plugin.service.isEngineAvailable = originalEngine;
       await ws.plugin.closeSession(session.sessionId).catch(() => undefined);
     }
 
