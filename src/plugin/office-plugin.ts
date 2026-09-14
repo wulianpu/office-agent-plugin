@@ -67,9 +67,13 @@ export class OfficePlugin {
     for (const format of ["docx", "xlsx", "pptx"] as const) {
       const plugin: OfficeEditorPlugin = createBasicEditorPlugin(format, {
         resolvePath: (ref) => service.store.resolvePath(ref),
-        save: async (_bytes, bookmark) => {
-          // Basic editor save path: the runtime commits from current source state.
+        save: async (_bytes, bookmark, sessionId) => {
+          // P1 (#8): a degraded editor reports success ONLY after the
+          // Runtime save gate (humanSave) validates/commits the source. A
+          // bare save revalidates the committed source stability and fails
+          // closed on external mutation — never a fake clean state.
           void bookmark;
+          await service.humanSave(sessionId);
           return { savedAt: Date.now() };
         }
       });

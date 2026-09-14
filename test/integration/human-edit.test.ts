@@ -89,6 +89,58 @@ describe("Human edit path (§12–§13)", () => {
     await ws.plugin.closeSession(session.sessionId);
   }, 20_000);
 
+  it("P1-high (#8): XLSX beginEdit no longer fails on the missing full runtime — and leaves NO writer state on any late failure", async () => {
+    const { writeXlsxFixture } = await import("../helpers/fixtures.js");
+    const xlsxPath = ws.root + "/edit.xlsx";
+    await writeXlsxFixture(xlsxPath, [{ name: "Data", rows: [["h1", "h2"]] }]);
+    const ref = await ws.plugin.registerArtifact(xlsxPath);
+    const session = await ws.plugin.openSession(ref);
+    await ws.plugin.service.sessions.ensureStrongIdentity(session.sessionId);
+
+    // Previously deterministic: human lease taken, then "no full FormatRuntime
+    // registered for xlsx" — a lease with no editor. Now the basic editor's
+    // capability drives the metadata profile and promotion succeeds.
+    const { lease, editor } = await ws.plugin.beginEdit(session.sessionId);
+    expect(lease.owner).toBe("human");
+    expect(editor.state).toBe("clean");
+    await ws.plugin.endEdit(session.sessionId);
+
+    // Late-failure compensation: a candidate gate failure AFTER editor
+    // preparation must leave zero writer/editor/lease residue.
+    const task = await ws.plugin.beginAgentTask(session.sessionId, {
+      intent: "block promotion after prepare",
+      destructiveAllowed: false
+    });
+    await expect(ws.plugin.beginEdit(session.sessionId)).rejects.toMatchObject({
+      code: "candidate-conflict"
+    });
+    // The only remaining writer is the AGENT task's own lease — no HUMAN
+    // lease was taken, no editor was bound, no dangling ArtifactLease beyond
+    // the agent's own context.
+    expect(ws.plugin.service.leases.activeLease(session.sessionId)?.owner).toBe("agent");
+    expect(ws.plugin.service.getSession(session.sessionId)?.editor).toBeUndefined();
+    expect(ws.plugin.service.editorLeaseCount()).toBe(0); // no dangling editor ArtifactLease
+    await ws.plugin.finalizeAgentTask(task);
+    await ws.plugin.rejectCandidate(session.sessionId);
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
+  it("P1 (#8): editor.save() goes through the Runtime save gate — external mutation fails closed, never a fake clean", async () => {
+    const ref = await ws.plugin.registerArtifact(docxPath);
+    const session = await ws.plugin.openSession(ref);
+    const { editor } = await ws.plugin.beginEdit(session.sessionId);
+    editor.markDirty?.();
+
+    // External save lands while the editor holds unsaved state: the gate
+    // (humanSave) detects the source moved off the committed revision.
+    const { appendFile } = await import("node:fs/promises");
+    await appendFile(docxPath, "x");
+    await expect(editor.save()).rejects.toMatchObject({ code: "source-mutated" });
+    expect(editor.state).toBe("error"); // NOT clean — the gate failed
+
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
   it("the editor contract lifecycle holds (mount/save/suspend/resume/dispose)", async () => {
     const ref = await ws.plugin.registerArtifact(docxPath);
     const session = await ws.plugin.openSession(ref);

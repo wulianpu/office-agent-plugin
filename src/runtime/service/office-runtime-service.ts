@@ -374,8 +374,47 @@ export class OfficeRuntimeService {
   }
 
   /** §13: first mutation promotes the read-only tab to an editor in place. */
+  /**
+   * P1-high (#8): the context profile follows the ACTUAL editor capability —
+   * basic/degraded editors run on the metadata context they really use;
+   * only native-engine editors demand the full parse. This keeps XLSX (and
+   * DOCX/PPTX with the vendor unavailable) from deterministically failing
+   * on "no full FormatRuntime registered" AFTER the human lease was taken.
+   */
+  private editorProfileFor(plugin: OfficeEditorPlugin): "full" | "metadata" {
+    return plugin.engine === "basic" ? "metadata" : "full";
+  }
+
   async beginEdit(sessionId: string, bookmark?: ViewBookmark): Promise<{ lease: WriterLease; editor: EditorInstance }> {
     const session = this.sessions.require(sessionId);
+    const plugin: OfficeEditorPlugin | undefined = this.editorHost.pluginFor(session.format);
+    if (!plugin) {
+      throw new OfficeRuntimeError("unsupported-format", `no editor plugin for ${session.format}`);
+    }
+
+    // P1-high (#8): PREPARE all editor resources BEFORE taking the human
+    // lease — plugin lookup, context build, mount and activation all
+    // precede the writer commit point, so any failure leaves zero writer
+    // state instead of "lease held, no editor".
+    const artifactLease = await this.acquireArtifactLease(
+      session.artifactRef,
+      `editor:${sessionId}`,
+      this.editorProfileFor(plugin)
+    );
+    let editor: EditorInstance;
+    try {
+      editor = await this.editorHost.mount(plugin, {
+        sessionId,
+        artifactContext: artifactLease.context,
+        bookmark,
+        readOnly: false
+      });
+      await editor.activateEdit();
+    } catch (error) {
+      artifactLease.release();
+      throw error;
+    }
+
     const result = await promoteToEdit(
       {
         store: this.store,
@@ -389,19 +428,15 @@ export class OfficeRuntimeService {
       },
       sessionId,
       bookmark
-    );
-    const plugin: OfficeEditorPlugin | undefined = this.editorHost.pluginFor(session.format);
-    if (!plugin) {
-      throw new OfficeRuntimeError("unsupported-format", `no editor plugin for ${session.format}`);
-    }
-    const artifactLease = await this.acquireArtifactLease(session.artifactRef, `editor:${sessionId}`, "full");
-    const editor = await this.editorHost.mount(plugin, {
-      sessionId,
-      artifactContext: artifactLease.context,
-      bookmark,
-      readOnly: false
+    ).catch(async (error: unknown) => {
+      // Compensation: the writer commit point failed after the editor was
+      // prepared — release the prepared resources with a symmetric audit
+      // trail and no half-bound session state.
+      artifactLease.release();
+      await editor.dispose().catch(() => undefined);
+      throw error;
     });
-    await editor.activateEdit();
+
     this.sessions.updateSession(sessionId, (s) => {
       s.editor = {
         instanceId: editor.instanceId,
@@ -678,6 +713,11 @@ export class OfficeRuntimeService {
 
   isEngineAvailable(): boolean {
     return this.engineAvailable;
+  }
+
+  /** Editor ArtifactLease count (test introspection for #8 rollback). */
+  editorLeaseCount(): number {
+    return this.editorArtifactLeases.size;
   }
 
   /** §146: GenOffice engine availability per format (capability matrix input). */

@@ -21,7 +21,9 @@ import { renderDocxOutline, renderPptxOutline, renderXlsxOutline } from "../../p
 import { newId } from "../../support/ids.js";
 
 export interface BasicEditorSave {
-  (bytes: undefined, bookmark: ViewBookmark | undefined): Promise<EditorSaveResult>;
+  // P1 (#8): the sessionId of the mounted instance flows to the runtime
+  // save gate (humanSave) so an editor save can never bypass it.
+  (bytes: undefined, bookmark: ViewBookmark | undefined, sessionId: string): Promise<EditorSaveResult>;
 }
 
 export class BasicEditorInstance implements EditorInstance {
@@ -67,7 +69,7 @@ export class BasicEditorInstance implements EditorInstance {
     }
     this.state = "saving";
     try {
-      const result = await this.saveImpl(undefined, this.bookmark);
+      const result = await this.saveImpl(undefined, this.bookmark, this.bootstrap.sessionId);
       this.state = "clean";
       return result;
     } catch (error) {
