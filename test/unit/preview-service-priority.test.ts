@@ -8,7 +8,7 @@ import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PreviewService } from "../../src/preview/preview-service.js";
+import { PreviewService, normalizeAndValidateScope } from "../../src/preview/preview-service.js";
 import { ArtifactRegistry } from "../../src/artifact/registry/artifact-registry.js";
 import { Scheduler } from "../../src/runtime/scheduler/scheduler.js";
 import { ResourceGovernor } from "../../src/runtime/resources/resource-governor.js";
@@ -670,6 +670,54 @@ describe("PreviewService sidecar scheduling (round 9, issue #3)", () => {
     await Promise.allSettled([backgroundA, backgroundB, visibleA]);
     // Still ONE parse for artifact A (dedup preserved through the join).
     expect(runtime.builds.filter((ref) => ref === "art-pa")).toHaveLength(1);
+  });
+
+  it("normalizeAndValidateScope rejects malformed scopes with a typed error before any cache/work (round 10 reopen #5)", async () => {
+    const expectInvalid = (scope: unknown, fragment: string) => {
+      try {
+        normalizeAndValidateScope(scope as never);
+        throw new Error(`expected invalid-scope for ${fragment}`);
+      } catch (error) {
+        expect((error as { code?: string }).code).toBe("invalid-scope");
+      }
+    };
+    expectInvalid({ location: { range: { fromRow: -1, toRow: 5, fromCol: 1, toCol: 2 } } }, "negative row");
+    expectInvalid({ location: { range: { fromRow: 10, toRow: 5, fromCol: 1, toCol: 2 } } }, "from > to");
+    expectInvalid({ location: { range: { fromRow: Number.NaN, toRow: 5, fromCol: 1, toCol: 2 } } }, "NaN row");
+    expectInvalid({ location: { range: { fromRow: Number.POSITIVE_INFINITY, toRow: 5, fromCol: 1, toCol: 2 } } }, "Infinity row");
+    expectInvalid({ location: { slide: 0 } }, "slide 0");
+    expectInvalid({ location: { slide: 1.5 } }, "fractional slide");
+    expectInvalid({ location: { block: -1 } }, "negative block");
+    expectInvalid({ maxEntries: 0 }, "maxEntries 0");
+    expectInvalid({ maxEntries: 100000 }, "maxEntries beyond ceiling");
+    expectInvalid({ location: { sheet: "" } }, "empty sheet");
+    // Valid input normalizes and flows (integers stay integers).
+    expect(normalizeAndValidateScope({ location: { slide: 5 }, maxEntries: 3 })).toEqual({
+      location: { slide: 5 },
+      maxEntries: 3
+    });
+    expect(normalizeAndValidateScope(undefined)).toBeUndefined();
+
+    // End-to-end: the service rejects invalid scopes with the typed error.
+    const scheduler = new Scheduler();
+    const registry = new ArtifactRegistry();
+    registry.registerRuntime(xlsxRuntime());
+    const path = join(dir, "validate.xlsx");
+    await writeFile(path, Buffer.alloc(16, 1));
+    registry.setPathResolver(() => path);
+    const service = new PreviewService(
+      { formatOf: () => "xlsx", resolvePath: () => path } as unknown as ArtifactStore,
+      registry,
+      scheduler
+    );
+    await expect(
+      service.preview({
+        requestId: "bad-scope",
+        artifactRef: "art-validate",
+        priority: "visible",
+        scope: { location: { range: { fromRow: 5, toRow: 1, fromCol: 1, toCol: 2 } } }
+      })
+    ).rejects.toMatchObject({ code: "invalid-scope" });
   });
 
   it("the full 1-based range (origin + extent) is forwarded to the sidecar port (round 10 reopen)", async () => {

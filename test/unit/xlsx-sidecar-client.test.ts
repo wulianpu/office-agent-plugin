@@ -146,6 +146,25 @@ describe("sidecarPreviewWindow scope boundaries (round 10 reopen #3)", () => {
     expect(out[0]!.window).toHaveLength(3);
   });
 
+  it("an explicit sheet reads ONLY that sheet — no native reads for the others (round 10 reopen #5)", async () => {
+    const reads: Array<Record<string, number>> = [];
+    const fake = fakeClient(
+      [
+        { id: "sh-a", name: "Alpha", rowCount: 10, columnCount: 3 },
+        { id: "sh-d", name: "Data", rowCount: 10, columnCount: 3 },
+        { id: "sh-s", name: "Summary", rowCount: 10, columnCount: 3 },
+        { id: "sh-z", name: "Zeta", rowCount: 10, columnCount: 3 }
+      ],
+      reads,
+      [{ row: 0, column: 0, value: "data-value" }]
+    );
+    const out = await sidecarPreviewWindow(fake, "book.xlsx", { sheet: "Data" });
+    expect(out).toHaveLength(1); // ONLY Data
+    expect(out[0]!.name).toBe("Data");
+    expect(reads).toHaveLength(1); // one native read — Alpha/Summary/Zeta untouched
+    expect((reads[0] as { id?: string }).id ?? true).toBe(true); // readSheetWindow passes ids opaquely
+  });
+
   it("an origin beyond the declared extent yields an explicitly empty window without reads", async () => {
     const reads: Array<Record<string, number>> = [];
     const fake = fakeClient([{ id: "1", name: "S", rowCount: 20, columnCount: 3 }], reads);

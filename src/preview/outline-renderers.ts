@@ -4,7 +4,7 @@
  * the visible window, never the file size (§31, PERF-13).
  */
 
-import type { PreviewOutline, PreviewScope } from "../contracts/preview.js";
+import { PREVIEW_RANGE_MAX_COLS, PREVIEW_RANGE_MAX_ROWS, type PreviewOutline, type PreviewScope } from "../contracts/preview.js";
 import { concatenatedTagTexts, decodeXmlEntities, extractTagTexts, splitRows, splitTagged } from "../support/xml-lite.js";
 import { readZipEntry, readZipIndex, streamZipEntry } from "../artifact/scanner/zip.js";
 
@@ -79,7 +79,10 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
         rid: attrs.match(/\br:id="([^"]+)"/)?.[1]
       };
     })
-    .filter((s): s is { name: string; rid: string } => Boolean(s.name && s.rid));
+    .filter((s): s is { name: string; rid: string } => Boolean(s.name && s.rid))
+    // Round 10 reopen #5: decode the XML attribute — a real sheet named
+    // "R&D" is written R&amp;D and must match/echo as R&D.
+    .map((s) => ({ ...s, name: decodeXmlEntities(s.name) }));
 
   // sharedStrings (bounded): the INDEX UNIT is <si>, not <t>. A Rich Text
   // <si> carries multiple <r><t> runs that concatenate into ONE entry —
@@ -117,11 +120,16 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   // range/maxEntries bound the window; maxEntries never lifts the hard caps.
   const wantedSheet = scope?.location?.sheet;
   const range = scope?.location?.range;
-  const maxRows = Math.min(
-    XLSX_MAX_ROWS,
-    Math.max(1, scope?.maxEntries ?? (range ? range.toRow - range.fromRow + 1 : XLSX_MAX_ROWS))
-  );
-  const maxCols = range ? Math.min(XLSX_MAX_COLS, range.toCol - range.fromCol + 1) : XLSX_MAX_COLS;
+  // Round 10 reopen #5: an EXPLICIT range replaces the default 60x24 window
+  // and is bounded by the shared absolute ceilings (PREVIEW_RANGE_MAX_*),
+  // identically to the sidecar path — a wide range no longer silently
+  // truncates to 24/60 on this path only.
+  const maxRows = range
+    ? Math.min(PREVIEW_RANGE_MAX_ROWS, Math.max(1, scope?.maxEntries ?? (range.toRow - range.fromRow + 1)))
+    : Math.min(XLSX_MAX_ROWS, Math.max(1, scope?.maxEntries ?? XLSX_MAX_ROWS));
+  const maxCols = range
+    ? Math.min(PREVIEW_RANGE_MAX_COLS, range.toCol - range.fromCol + 1)
+    : XLSX_MAX_COLS;
   const fromRow = range ? Math.max(1, range.fromRow) : 1;
   const fromCol = range ? Math.max(1, range.fromCol) : 1;
   // An explicit range is a HARD row boundary: maxEntries may narrow it but
@@ -134,12 +142,9 @@ export async function renderXlsxOutline(path: string, scope?: PreviewScope): Pro
   if (wantedSheet && !sheetTags.some((t) => t.name === wantedSheet)) {
     return { kind: "xlsx", sheets: [] };
   }
-  const ordered = wantedSheet
-    ? [
-        sheetTags.find((t) => t.name === wantedSheet)!,
-        ...sheetTags.filter((t) => t.name !== wantedSheet)
-      ]
-    : sheetTags;
+  // Round 10 reopen #5: a single-sheet scope returns ONLY that sheet —
+  // never the target plus trailing unrelated sheets.
+  const ordered = wantedSheet ? [sheetTags.find((t) => t.name === wantedSheet)!] : sheetTags;
 
   let sheetIdx = 0;
   for (const tag of ordered) {
@@ -242,23 +247,69 @@ function columnToIndex(letters: string): number {
   return n - 1;
 }
 
+/**
+ * Presentation-ordered slide parts (round 10 reopen #5): the VISIBLE slide
+ * order comes from ppt/presentation.xml's <p:sldIdLst> resolved through
+ * presentation.xml.rels — part file names (slideN.xml) do NOT track display
+ * order once a user reorders slides. Falls back to part-number order when
+ * the presentation part or its rels are absent/unresolvable.
+ */
+async function presentationOrderedSlides(
+  path: string,
+  index: Awaited<ReturnType<typeof readZipIndex>>,
+  partSorted: Array<{ name: string }>
+): Promise<Array<{ name: string }>> {
+  const presXml = (
+    await readZipEntry(path, index, "ppt/presentation.xml", 4 * 1024 * 1024).catch(() => Buffer.alloc(0))
+  ).toString("utf8");
+  const relsXml = (
+    await readZipEntry(path, index, "ppt/_rels/presentation.xml.rels", 4 * 1024 * 1024).catch(() => Buffer.alloc(0))
+  ).toString("utf8");
+  if (!presXml || !relsXml) return partSorted;
+  const relTargets = new Map(
+    [...relsXml.matchAll(/<(?:[\w.-]+:)?Relationship\b([^>]*?)\/?>/g)]
+      .map((m) => {
+        const attrs = m[1] ?? "";
+        const id = attrs.match(/\bId="([^"]+)"/)?.[1];
+        const target = attrs.match(/\bTarget="([^"]+)"/)?.[1];
+        return id && target ? ([id, target.replace(/^\//, "")] as [string, string]) : undefined;
+      })
+      .filter((e): e is [string, string] => Boolean(e))
+  );
+  const orderedIds = [...presXml.matchAll(/<(?:[\w.-]+:)?sldId\b[^>]*?(?:[\w.-]+:)?r:id="([^"]+)"/g)].map(
+    (m) => m[1]!
+  );
+  const byPart = new Map(partSorted.map((e) => [e.name, e]));
+  const ordered: Array<{ name: string }> = [];
+  for (const rid of orderedIds) {
+    const target = relTargets.get(rid);
+    if (!target) continue;
+    const name = target.startsWith("ppt/") ? target : `ppt/${target}`;
+    const entry = byPart.get(name);
+    if (entry) ordered.push(entry);
+  }
+  return ordered.length > 0 ? ordered : partSorted;
+}
+
 export async function renderPptxOutline(path: string, scope?: PreviewScope): Promise<PreviewOutline> {
   // Round 10 scoped windowing: the slide anchor opens the window at the
-  // requested 1-based slide; maxEntries caps it. The hard ceiling stays.
-  // Round 10 reopen: an anchor beyond the deck clamps to the LAST slide —
-  // the same policy as the engine outline/SVG window (svgWindowOf), never
-  // an empty outline in one view and a last-page window in another.
+  // requested 1-based PRESENTATION position; maxEntries caps it. The hard
+  // ceiling stays. Round 10 reopen: an anchor beyond the deck clamps to the
+  // LAST slide — the same policy as the engine outline/SVG window
+  // (svgWindowOf), never an empty outline in one view and a last-page
+  // window in another.
   const anchor = Math.max(1, Math.floor(scope?.location?.slide ?? 1));
   const maxSlides = Math.min(PPTX_MAX_SLIDES, Math.max(1, scope?.maxEntries ?? PPTX_MAX_SLIDES));
   const index = await readZipIndex(path);
-  const all = index.entries
+  const partSorted = index.entries
     .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.name))
     .sort((a, b) => slideNo(a.name) - slideNo(b.name));
-  const inWindow = all.filter((e) => slideNo(e.name) >= anchor && slideNo(e.name) < anchor + maxSlides);
-  const slideEntries = inWindow.length > 0 ? inWindow : all.slice(-1);
+  const ordered = await presentationOrderedSlides(path, index, partSorted);
+  const inWindow = ordered.filter((_, i) => i + 1 >= anchor && i + 1 < anchor + maxSlides);
+  const slideEntries = inWindow.length > 0 ? inWindow : ordered.slice(-1);
 
   const slides: Array<{ index: number; shapes: Array<{ name?: string; text?: string }> }> = [];
-  for (const entry of slideEntries) {
+  for (const [position, entry] of slideEntries.entries()) {
     const xml = (await readZipEntry(path, index, entry.name, 32 * 1024 * 1024).catch(() => Buffer.alloc(0))).toString("utf8");
     const texts = extractTagTexts(xml, "a:t", { pending: "" });
     const shapes: Array<{ name?: string; text?: string }> = [];
@@ -271,8 +322,11 @@ export async function renderPptxOutline(path: string, scope?: PreviewScope): Pro
         text: shapeTexts.join(" ") || undefined
       });
     }
-    const slideIndex = slideNo(entry.name);
-    slides.push({ index: slideIndex, shapes: shapes.length > 0 ? shapes : [{ text: texts.join(" ") || undefined }] });
+    // The outline index is the PRESENTATION position (1-based), not the
+    // part number — engine and fallback agree on this ordering.
+    const absolutePosition = ordered.indexOf(entry) + 1;
+    slides.push({ index: absolutePosition, shapes: shapes.length > 0 ? shapes : [{ text: texts.join(" ") || undefined }] });
+    void position;
   }
   return { kind: "pptx", slides };
 }

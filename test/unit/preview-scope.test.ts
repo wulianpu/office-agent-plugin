@@ -185,6 +185,97 @@ describe("PreviewScope (round 10, issue #4)", () => {
     expect(outline.sheets[0]!.window[10]).toEqual(["IW20", "IX20", "IY20"]);
   });
 
+  it("an explicit sheet returns ONLY that sheet — 4-sheet workbook, zero unrelated reads (round 10 reopen #5)", async () => {
+    // Fallback path.
+    const zip = buildZip([
+      { name: "xl/workbook.xml", data: `<?xml version="1.0"?><workbook><sheets><sheet name="Alpha" sheetId="1" r:id="r1"/><sheet name="Data" sheetId="2" r:id="r2"/><sheet name="Summary" sheetId="3" r:id="r3"/><sheet name="Zeta" sheetId="4" r:id="r4"/></sheets></workbook>` },
+      { name: "xl/_rels/workbook.xml.rels", data: `<?xml version="1.0"?><Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/><Relationship Id="r2" Target="worksheets/sheet2.xml"/><Relationship Id="r3" Target="worksheets/sheet3.xml"/><Relationship Id="r4" Target="worksheets/sheet4.xml"/></Relationships>` },
+      { name: "xl/worksheets/sheet1.xml", data: sheetXml([["alpha"]]) },
+      { name: "xl/worksheets/sheet2.xml", data: sheetXml([["data-value"]]) },
+      { name: "xl/worksheets/sheet3.xml", data: sheetXml([["summary"]]) },
+      { name: "xl/worksheets/sheet4.xml", data: sheetXml([["zeta"]]) }
+    ]);
+    const path = join(dir, "isolated.xlsx");
+    await writeFile(path, zip);
+    const outline = await renderXlsxOutline(path, { location: { sheet: "Data" } });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets).toHaveLength(1); // ONLY Data — never Data + 3 others
+    expect(outline.sheets[0]!.name).toBe("Data");
+    expect(outline.sheets[0]!.window[0]![0]).toBe("data-value");
+  });
+
+  it("wide explicit ranges exceed the default 24-col window identically to the sidecar path (round 10 reopen #5)", async () => {
+    const mk = (r: number) =>
+      Array.from({ length: 56 }, (_, c) => `<c r="${colName(c)}${r}"><v>${colName(c)}${r}</v></c>`).join("");
+    const rows = Array.from({ length: 10 }, (_, i) => `<row r="${i + 1}">${mk(i + 1)}</row>`).join("");
+    const path = await writeRawSheetWorkbook("wide-range", rows);
+
+    // A1:AZ10 — 52 columns: no silent truncation to 24.
+    const az = await renderXlsxOutline(path, { location: { range: { fromRow: 1, toRow: 10, fromCol: 1, toCol: 52 } } });
+    if (az.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(az.sheets[0]!.window[0]).toHaveLength(52);
+    expect(az.sheets[0]!.window[0]![51]).toBe("AZ1");
+
+    // AA1:BD10 — columns 27..56 (width 30), starting beyond the old cap.
+    const bd = await renderXlsxOutline(path, { location: { range: { fromRow: 1, toRow: 10, fromCol: 27, toCol: 56 } } });
+    if (bd.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(bd.sheets[0]!.window[0]).toHaveLength(30);
+    expect(bd.sheets[0]!.window[0]![0]).toBe("AA1");
+    expect(bd.sheets[0]!.window[0]![29]).toBe("BD1");
+  });
+
+  it("PPTX fallback follows PRESENTATION order (sldIdLst), not part numbers (round 10 reopen #5)", async () => {
+    const slide = (n: number) => ({
+      name: `ppt/slides/slide${n}.xml`,
+      data: `<?xml version="1.0"?><p:sld><p:sp><p:cNvPr id="1" name="S${n}"/><a:t>content-of-slide${n}</a:t></p:sp></p:sld>`
+    });
+    const zip = buildZip([
+      { name: "[Content_Types].xml", data: `<?xml version="1.0"?><Types/>` },
+      slide(1),
+      slide(2),
+      slide(3),
+      // Visible order: slide3, slide1, slide2.
+      {
+        name: "ppt/presentation.xml",
+        data: `<?xml version="1.0"?><p:presentation xmlns:r="rel"><p:sldIdLst><p:sldId id="256" r:id="rA"/><p:sldId id="257" r:id="rB"/><p:sldId id="258" r:id="rC"/></p:sldIdLst></p:presentation>`
+      },
+      {
+        name: "ppt/_rels/presentation.xml.rels",
+        data: `<?xml version="1.0"?><Relationships><Relationship Id="rA" Target="slides/slide3.xml"/><Relationship Id="rB" Target="slides/slide1.xml"/><Relationship Id="rC" Target="slides/slide2.xml"/></Relationships>`
+      }
+    ]);
+    const path = join(dir, "reordered.pptx");
+    await writeFile(path, zip);
+
+    // Default outline follows presentation order with 1-based positions.
+    const outline = await renderPptxOutline(path);
+    if (outline.kind !== "pptx") throw new Error("expected pptx outline");
+    expect(outline.slides.map((s) => s.index)).toEqual([1, 2, 3]);
+    expect(outline.slides[0]!.shapes[0]!.text).toContain("content-of-slide3");
+
+    // slide=1 is the FIRST VISIBLE slide — slide3's content, not slide1.xml.
+    const first = await renderPptxOutline(path, { location: { slide: 1 }, maxEntries: undefined });
+    if (first.kind !== "pptx") throw new Error("expected pptx outline");
+    expect(first.slides[0]!.shapes[0]!.text).toContain("content-of-slide3");
+    expect(first.slides[0]!.index).toBe(1);
+  });
+
+  it("sheet names with XML entities match and echo decoded (round 10 reopen #5)", async () => {
+    const zip = buildZip([
+      { name: "xl/workbook.xml", data: `<?xml version="1.0"?><workbook><sheets><sheet name="R&amp;D" sheetId="1" r:id="r1"/></sheets></workbook>` },
+      { name: "xl/_rels/workbook.xml.rels", data: `<?xml version="1.0"?><Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>` },
+      { name: "xl/worksheets/sheet1.xml", data: sheetXml([["rd-value"]]) }
+    ]);
+    const path = join(dir, "entity-sheet.xlsx");
+    await writeFile(path, zip);
+    // Scope uses the REAL name; the fallback decodes R&amp;D before matching.
+    const outline = await renderXlsxOutline(path, { location: { sheet: "R&D" } });
+    if (outline.kind !== "xlsx") throw new Error("expected xlsx outline");
+    expect(outline.sheets).toHaveLength(1);
+    expect(outline.sheets[0]!.name).toBe("R&D");
+    expect(outline.sheets[0]!.window[0]![0]).toBe("rd-value");
+  });
+
   it("pptx out-of-range scope clamps to the last slide in BOTH outline and SVG window (round 10 reopen)", async () => {
     // Engine-path policy: svgWindowOf clamps `from` to the last slide; the
     // outline now derives from the same function.

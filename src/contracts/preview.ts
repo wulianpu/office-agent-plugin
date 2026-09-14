@@ -7,6 +7,15 @@ import type { PreviewCacheKey } from "./artifact.js";
 
 export type PreviewPriority = "visible" | "prefetch" | "background";
 
+/**
+ * Round 10 reopen #5: absolute safety ceilings for EXPLICIT ranges — an
+ * explicit range replaces the default 60×24 window and may exceed it, on
+ * BOTH the sidecar and the JS-fallback path alike (shared constants keep
+ * the two paths shape-identical).
+ */
+export const PREVIEW_RANGE_MAX_ROWS = 500;
+export const PREVIEW_RANGE_MAX_COLS = 128;
+
 /** Typed scope location (round 10): per-format anchor into the document. */
 export interface PreviewScopeLocation {
   /** XLSX sheet name to window into. */

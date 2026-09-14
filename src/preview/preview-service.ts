@@ -10,8 +10,11 @@ import type {
   PreviewModel,
   PreviewRequest,
   PreviewResult,
-  PreviewScope
+  PreviewScope,
+  PreviewScopeLocation
 } from "../contracts/preview.js";
+import { PREVIEW_RANGE_MAX_COLS, PREVIEW_RANGE_MAX_ROWS } from "../contracts/preview.js";
+import { OfficeRuntimeError } from "../contracts/document.js";
 import type { PreviewCacheKey } from "../contracts/artifact.js";
 import type { OfficeFormat } from "../contracts/ids.js";
 import { fileFingerprint, fingerprintKey } from "../support/fsx.js";
@@ -56,6 +59,64 @@ interface InflightRender {
    *  signal — aborted only when the last consumer leaves. A personal
    *  consumer abort must never poison the shared build for later joiners. */
   lifecycle: AbortController;
+}
+
+/**
+ * Round 10 reopen #5: single validation/normalization gate for public
+ * scopes — every numeric field must be a finite integer within its domain
+ * BEFORE it reaches cache keys or either execution path (which previously
+ * each applied their own Math.max/floor corrections). Invalid input throws
+ * a typed error instead of silently shape-shifting downstream.
+ */
+export function normalizeAndValidateScope(scope?: PreviewScope): PreviewScope | undefined {
+  if (scope === undefined) return undefined;
+  const invalid = (reason: string): never => {
+    throw new OfficeRuntimeError("invalid-scope", `invalid PreviewScope: ${reason}`);
+  };
+  const int = (value: number | undefined, name: string, min: number): number | undefined => {
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < min) {
+      invalid(`${name} must be an integer >= ${min}, got ${String(value)}`);
+    }
+    return value;
+  };
+  const loc = scope.location ?? {};
+  if (loc.sheet !== undefined && (typeof loc.sheet !== "string" || loc.sheet.length === 0)) {
+    invalid("sheet must be a non-empty string");
+  }
+  const slide = int(loc.slide, "slide", 1);
+  const block = int(loc.block, "block", 0);
+  let range: PreviewScopeLocation["range"];
+  if (loc.range) {
+    const fromRow = int(loc.range.fromRow, "range.fromRow", 1)!;
+    const toRow = int(loc.range.toRow, "range.toRow", 1)!;
+    const fromCol = int(loc.range.fromCol, "range.fromCol", 1)!;
+    const toCol = int(loc.range.toCol, "range.toCol", 1)!;
+    if (fromRow > toRow || fromCol > toCol) invalid("range must be ordered (from <= to)");
+    if (toRow - fromRow + 1 > PREVIEW_RANGE_MAX_ROWS) {
+      invalid(`range height exceeds ${PREVIEW_RANGE_MAX_ROWS}`);
+    }
+    if (toCol - fromCol + 1 > PREVIEW_RANGE_MAX_COLS) {
+      invalid(`range width exceeds ${PREVIEW_RANGE_MAX_COLS}`);
+    }
+    range = { fromRow, toRow, fromCol, toCol };
+  }
+  let maxEntries: number | undefined;
+  if (scope.maxEntries !== undefined) {
+    maxEntries = int(scope.maxEntries, "maxEntries", 1);
+    if (maxEntries! > PREVIEW_RANGE_MAX_ROWS) {
+      invalid(`maxEntries exceeds ${PREVIEW_RANGE_MAX_ROWS}`);
+    }
+  }
+  const location: PreviewScopeLocation = {};
+  if (loc.sheet !== undefined) location.sheet = loc.sheet;
+  if (slide !== undefined) location.slide = slide;
+  if (block !== undefined) location.block = block;
+  if (range) location.range = range;
+  const normalized: PreviewScope = {};
+  if (Object.keys(location).length > 0) normalized.location = location;
+  if (maxEntries !== undefined) normalized.maxEntries = maxEntries;
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
 /**
@@ -205,10 +266,16 @@ export class PreviewService {
     const format = this.store.formatOf(request.artifactRef);
     const path = this.store.resolvePath(request.artifactRef);
 
+    // Round 10 reopen #5: validate/normalize the scope BEFORE it touches
+    // cache keys or either execution path — malformed input gets a typed
+    // error; the normalized form is the only one that flows onward.
+    const scope = normalizeAndValidateScope(request.scope);
+    request = { ...request, scope };
+
     const before = await fileFingerprint(path);
     // Round 10: the normalized scope is part of every cache/dedup identity —
     // two different windows of one artifact never share a result.
-    const scopeKey = normalizeScopeKey(request.scope);
+    const scopeKey = normalizeScopeKey(scope);
     const cacheKeyString = previewCacheKeyString(request.artifactRef, fingerprintKey(before), request.visual, scopeKey);
     const cached = this.cache.get(cacheKeyString);
     if (cached) {
@@ -398,9 +465,9 @@ export class PreviewService {
                 sheet: request.scope?.location?.sheet,
                 range,
                 maxRows: range
-                  ? Math.min(rangeHeight!, request.scope?.maxEntries ?? rangeHeight!)
+                  ? Math.min(PREVIEW_RANGE_MAX_ROWS, rangeHeight!, request.scope?.maxEntries ?? rangeHeight!)
                   : request.scope?.maxEntries,
-                maxCols: range ? rangeWidth : undefined
+                maxCols: range ? Math.min(PREVIEW_RANGE_MAX_COLS, rangeWidth!) : undefined
               });
             }
           });

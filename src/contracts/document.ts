@@ -99,7 +99,8 @@ export type SessionErrorCode =
   | "io-error"
   | "policy-denied"
   | "idempotency-conflict"
-  | "scope-violation";
+  | "scope-violation"
+  | "invalid-scope";
 
 export class OfficeRuntimeError extends Error {
   constructor(
