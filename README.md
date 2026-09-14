@@ -127,3 +127,10 @@ await plugin.acceptCandidate(session.sessionId);  // §75 原子提交 → 修�
   - **xlsx（§30 字面实现）**：Rust sidecar（calamine + IronCalc）已用 cargo 编译（`npm run sidecar:build`），stdio JSON 协议客户端接入；100k 行工作簿的有界视口读取经 sidecar 完成，工作簿内存留在 sidecar 进程（§31）。未编译时自动回退进程内流式解析。
 - **WPS 宿主适配器已实现（§86–§88）**：`WpsHostAdapter` 经 KWPP COM（PowerShell 桥，零新依赖）提供宿主真实渲染（slides→PNG）与一次性认证副本（copy→打开→SaveCopyAs→二次渲染；重序列化≠修复，损坏/拒开才 FAIL）。**验证阶梯实测可达 `consumer-certified`**。COM 为单用途服务器：套件与全量并行会互斥，故按 §86 Optional 定位单独回归：`npx vitest run test/integration/wps-host.test.ts`（5 用例）。PowerPoint 为残留 COM 注册（服务器启动失败），如实 unavailable。
 - Univer/Konva 交互编辑画布：SVG/PNG/表格视口的只读面已通过 Web 宿主交付；像素级交互编辑 UI 属 GenOffice app 层，在上述宿主容器内接入（见「渲染宿主方案」）。
+
+## 维护流程（main required CI gate）
+
+`main` 受 Repository Ruleset `main-required-ci-gate` 保护：所有变更（包括
+定时修复自动化）一律走 **branch → PR → `linux` + `windows` required
+checks 全绿 → merge**；直接 push、force-push 与分支删除均被平台拒绝，
+无任何 bypass 身份。临时 break-glass 需另行创建专用身份并显式授权。
