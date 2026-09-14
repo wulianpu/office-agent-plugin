@@ -33,6 +33,11 @@ export class ArtifactScanner {
 
   constructor(private readonly persistence?: ScanPersistence) {}
 
+  /** P1-high (#4): scan-cache resident bytes join the global ledger. */
+  wireCacheAccounting(reporter: (delta: number) => void): void {
+    this.scans.setBytesReporter(reporter);
+  }
+
   async scan(path: string, options: ScanOptions = {}): Promise<ArtifactScanResult> {
     const contentHash = await sha256File(path);
     const cached = this.scans.get(contentHash);

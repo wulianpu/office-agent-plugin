@@ -93,10 +93,21 @@ export class ResourceGovernor implements IResourceGovernor {
   }
 
   tryAcquire(request: ResourceRequest): ResourceLease | undefined {
+    // P1-high (#4): memory is an ADMISSION boundary, not accounting-only.
+    // Unprotected reservations (request.bytes — the scheduler's
+    // estimatedBytes path, or an explicit classes.memory amount) are refused
+    // when they would cross the global budget: the Scheduler keeps the job
+    // queued and acquire()'s retry loop runs the eviction ladder (real
+    // pressure relief for memory-only oversubscription). Protected writer
+    // state bypasses admission (§107: never evicted) but still counts.
+    const memoryRequested = (request.bytes ?? 0) + (request.classes.memory ?? 0);
+    if (!request.protected && this.memoryUsed + memoryRequested > this.budgets.memoryBytes) {
+      return undefined;
+    }
     for (const [cls, amount] of Object.entries(request.classes)) {
       if (!amount) continue;
       const key = cls as ResourceClass;
-      if (key === "memory") continue; // memory is accounting-only, admission via pressure
+      if (key === "memory") continue;
       const budgetKey = CONCURRENT_CLASSES[key];
       if (budgetKey) {
         const counter = this.counters.get(key)!;
@@ -163,6 +174,22 @@ export class ResourceGovernor implements IResourceGovernor {
     };
   }
 
+  /**
+   * P1-high (#4): resident cache bytes join the SAME global memory ledger.
+   * Local cache budgets remain as second-layer caps; growth here raises
+   * pressure and, on level transitions, schedules the eviction ladder —
+   * "trimmable" becomes "will actually trim at the global boundary".
+   */
+  reportCacheBytes(delta: number): void {
+    if (!delta) return;
+    this.memoryUsed = Math.max(0, this.memoryUsed + delta);
+    const before = this.lastPressure;
+    this.refreshPressure();
+    if (this.lastPressure !== "normal" && before === "normal") {
+      void this.applyPressureRelief().catch(() => undefined);
+    }
+  }
+
   registerTrimTarget(target: ResourceTrimTarget): void {
     this.trimTargets.push({ ...target, active: true });
   }
@@ -219,6 +246,7 @@ export class ResourceGovernor implements IResourceGovernor {
         if (this.lastPressure === "normal") break;
         await target.trim(level).catch(() => undefined);
       }
+      void level;
     } finally {
       this.trimming = false;
     }

@@ -80,8 +80,10 @@ export class ArtifactRegistry implements IArtifactRegistry {
     if (!runtime) {
       throw new Error(`no ${profile} FormatRuntime registered for ${input.format}`);
     }
-    const fingerprint = await this.fingerprintFor(input.artifactRef);
-    const key = contextKey(input.artifactRef, fingerprint, profile);
+    // Single stat feeds BOTH the context key and the transient peak
+    // estimate — a second await here widened the join race window (#4).
+    const fpInfo = await this.fingerprintInfo(input.artifactRef);
+    const key = contextKey(input.artifactRef, fpInfo.key, profile);
 
     const cached = this.completed.get(key);
     if (cached) {
@@ -108,10 +110,20 @@ export class ArtifactRegistry implements IArtifactRegistry {
         // Round 10 (P1-high): heavy context builds are scheduler/governor
         // admitted — a background full-profile parse no longer bypasses the
         // priority ladder. Full parses claim io+cpu; metadata stays light.
+        // P1 (#4): full builds also reserve their TRANSIENT peak working set
+        // (source bytes + parser multiplier) via estimatedBytes — the
+        // governor's memory admission now bounds concurrent parse peaks;
+        // the reservation is released when the job settles, after which the
+        // cached context is accounted as RESIDENT bytes via the completed
+        // cache's delta reporter (no double counting: phases are disjoint).
+        const peakBytes = profile === "full" ? peakWorkingSet(fpInfo.size) : 0;
         const handle = this.buildScheduler.submit({
           label: `artifact-build:${input.artifactRef}:${profile}`,
           priority: input.priority,
-          resources: profile === "full" ? { io: 1, cpu: 1 } : { io: 1 },
+          resources:
+            profile === "full"
+              ? { io: 1, cpu: 1, estimatedBytes: peakBytes }
+              : { io: 1 },
           run: async (signal) => {
             if (signal.aborted) throw new DOMException("cancelled", "AbortError");
             return await runBuild();
@@ -260,10 +272,17 @@ export class ArtifactRegistry implements IArtifactRegistry {
   }
 
   private async fingerprintFor(ref: ArtifactRef): Promise<string> {
+    return (await this.fingerprintInfo(ref)).key;
+  }
+
+  /** One stat → { context-key material, source size } (#4: the transient
+   *  peak reservation reuses the SAME fingerprint — no second stat, no
+   *  widened join race). */
+  private async fingerprintInfo(ref: ArtifactRef): Promise<{ key: string; size: bigint }> {
     // Path resolution is injected by the service wiring to avoid a store dependency here.
     const path = this.pathResolver(ref);
     const fp = await fileFingerprint(path);
-    return fingerprintKey(fp);
+    return { key: fingerprintKey(fp), size: fp.size };
   }
 
   private pathResolver: (ref: ArtifactRef) => string = () => {
@@ -273,6 +292,12 @@ export class ArtifactRegistry implements IArtifactRegistry {
   /** Service wiring: registry learns path resolution from the ArtifactStore. */
   setPathResolver(resolver: (ref: ArtifactRef) => string): void {
     this.pathResolver = resolver;
+  }
+
+  /** P1-high (#4): completed-context cache resident bytes join the global
+   *  governor memory ledger (local budget stays as a second-layer cap). */
+  wireCacheAccounting(reporter: (delta: number) => void): void {
+    this.completed.setBytesReporter(reporter);
   }
 
   private leaseFor(
@@ -329,6 +354,20 @@ export class ArtifactRegistry implements IArtifactRegistry {
     }
     this.runtimes.clear();
   }
+}
+
+/**
+ * Conservative transient peak estimate for a full GenOffice parse (#4 P1):
+ * source buffer + parser model + decode working set. Capped so pathological
+ * sources degrade to a bounded reservation instead of bypassing admission.
+ */
+function peakWorkingSet(sourceBytes: bigint): number {
+  const MULT = 4n;
+  const CAP = 256n * 1024n * 1024n;
+  const FLOOR = 16n * 1024n * 1024n;
+  const estimate = sourceBytes * MULT;
+  const clamped = estimate > CAP ? CAP : estimate < FLOOR ? FLOOR : estimate;
+  return Number(clamped);
 }
 
 export function contextKey(ref: ArtifactRef, fpKey: string, profile: ArtifactContextProfile): string {

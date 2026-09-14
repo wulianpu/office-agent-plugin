@@ -30,8 +30,18 @@ export class ByteBudgetCache<V> {
     readonly kind: CacheKind,
     readonly byteBudget: number,
     private readonly sizeEstimate: (value: V) => number,
-    private readonly policy: CacheAdmissionPolicy = { maxItemShareOfBudget: 0.25 }
+    private readonly policy: CacheAdmissionPolicy = { maxItemShareOfBudget: 0.25 },
+    /** P1-high (#4): net resident-byte delta reporter (global governor ledger).
+     *  Reports the cache's OWN holding change per mutation — owners wire this
+     *  to ResourceGovernor.reportCacheBytes; local budgets stay as a second
+     *  layer. Reported deltas are exact (set/overwrite/evict/delete/clear). */
+    private onBytesDelta?: (delta: number) => void
   ) {}
+
+  /** Late wiring (owner constructs the cache before the governor reporter). */
+  setBytesReporter(reporter: (delta: number) => void): void {
+    this.onBytesDelta = reporter;
+  }
 
   sizeEstimateOf(value: V): number {
     return this.sizeEstimate(value);
@@ -60,6 +70,7 @@ export class ByteBudgetCache<V> {
   }
 
   set(key: string, value: V): void {
+    const before = this.bytesHeld;
     const bytes = this.sizeEstimate(value);
     if (!this.admit(bytes)) return;
     const existing = this.map.get(key);
@@ -78,20 +89,25 @@ export class ByteBudgetCache<V> {
     this.map.set(key, { value });
     this.bytesHeld += bytes;
     this.syncStats();
+    this.onBytesDelta?.(this.bytesHeld - before);
   }
 
   delete(key: string): void {
+    const before = this.bytesHeld;
     const entry = this.map.get(key);
     if (!entry) return;
     this.bytesHeld -= this.sizeEstimate(entry.value);
     this.map.delete(key);
     this.syncStats();
+    this.onBytesDelta?.(this.bytesHeld - before);
   }
 
   clear(): void {
+    const before = this.bytesHeld;
     this.map.clear();
     this.bytesHeld = 0;
     this.syncStats();
+    this.onBytesDelta?.(this.bytesHeld - before);
   }
 
   /** Evict everything (used by pressure ladder for the most recyclable layers). */

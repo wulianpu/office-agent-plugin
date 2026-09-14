@@ -112,6 +112,9 @@ export class OfficeRuntimeService {
   readonly xlsxSidecar = new XlsxSidecarClient();
   /** §91: SVG→PNG rasterizer (L5 pixel renders, host thumbnails). */
   readonly raster = new RasterCache();
+  private wireRasterAccounting(reporter: (delta: number) => void): void {
+    this.raster.wireCacheAccounting(reporter);
+  }
   /** §86: optional WPS host adapter (KWPP COM) for L7 certification. */
   readonly wpsHost = new WpsHostAdapter();
   private wpsAvailable = false;
@@ -145,9 +148,14 @@ export class OfficeRuntimeService {
     this.events = new DurableEventBus(this.repos);
     this.store = new ArtifactStore(options.workspaceRoot, this.repos);
     this.scanner = new ArtifactScanner(this.repos);
+    this.scanner.wireCacheAccounting((delta) => this.governor.reportCacheBytes(delta));
     this.registry = new ArtifactRegistry();
     // Round 10: context builds enter the shared priority ladder + governor.
     this.registry.setBuildScheduler(this.scheduler);
+    // P1-high (#4): the four read-plane caches report resident bytes into the
+    // SAME global memory ledger the governor admits against — local budgets
+    // become second-layer caps, and growth now raises real pressure.
+    this.registry.wireCacheAccounting((delta) => this.governor.reportCacheBytes(delta));
     const resolveByRef = (ref: string) => this.store.resolvePath(ref);
     for (const format of ["docx", "xlsx", "pptx"] as const) {
       const runtime = new BasicFormatRuntime(format);
@@ -210,6 +218,8 @@ export class OfficeRuntimeService {
     this.previewService = new PreviewService(this.store, this.registry, this.scheduler, {
       previewWindow: (path, options) => sidecarPreviewWindow(this.xlsxSidecar, path, options)
     });
+    this.previewService.wireCacheAccounting((delta) => this.governor.reportCacheBytes(delta));
+    this.wireRasterAccounting((delta) => this.governor.reportCacheBytes(delta));
 
     this.registerTrimTargets();
   }

@@ -547,6 +547,11 @@ export class PreviewService {
     }
   }
 
+  /** P1-high (#4): preview-model cache resident bytes join the global ledger. */
+  wireCacheAccounting(reporter: (delta: number) => void): void {
+    this.cache.setBytesReporter(reporter);
+  }
+
   /** Invalidate preview cache entries for an artifact (revision change). */
   invalidate(artifactRef: string): void {
     for (const [key] of Array.from(this.cache.entries())) {

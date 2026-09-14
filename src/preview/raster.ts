@@ -34,6 +34,11 @@ export class RasterCache {
     );
   }
 
+  /** P1-high (#4): encoded raster bytes join the global ledger. */
+  wireCacheAccounting(reporter: (delta: number) => void): void {
+    this.cache.setBytesReporter(reporter);
+  }
+
   async rasterize(svg: string, options: RasterOptions = {}): Promise<RasterResult> {
     const width = options.width ?? 960;
     const key = `${Buffer.from(svg).length}:${hashSvg(svg)}:${width}`;
