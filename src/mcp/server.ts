@@ -10,6 +10,10 @@ import type { OfficeRuntimeService } from "../runtime/service/office-runtime-ser
 
 const PROTOCOL_VERSION = "2026-01-26";
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 interface JsonRpcRequest {
   jsonrpc: "2.0";
   id?: number | string | null;
@@ -152,15 +156,25 @@ export class McpStdioServer {
           const result = await this.callTool(name, args);
           this.respondOk(
             id,
-            { content: [{ type: "text", text: JSON.stringify(result) }] },
+            { content: [{ type: "text", text: JSON.stringify(this.wireSafe(result)) }] },
             output
           );
         } catch (error) {
-          // Tool errors are in-band results, not protocol errors.
+          // Tool errors are in-band results, not protocol errors. P1-high
+          // (#7): the error path crosses the SAME INV-12 boundary as
+          // success — OfficeCLI timeout/engine/stderr messages carry real
+          // physical paths and must never reach the Agent wire.
           this.respondOk(
             id,
             {
-              content: [{ type: "text", text: JSON.stringify({ error: String((error as Error)?.message ?? error) }) }],
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    this.wireSafe({ error: String((error as Error)?.message ?? error) })
+                  )
+                }
+              ],
               isError: true
             },
             output
@@ -190,6 +204,39 @@ export class McpStdioServer {
       default:
         throw new Error(`unknown tool: ${name}`);
     }
+  }
+
+  /**
+   * P1-high (#7): the transport's FINAL INV-12 boundary — every payload
+   * (success AND error) crosses this on its way to the Agent wire.
+   * Physical paths of registered artifacts (slash and backslash forms)
+   * and workspace-runtime fragments are replaced with capability
+   * tokens; verbose diagnostics stay local, never on the wire.
+   */
+  private wireSafe<T>(value: T): T {
+    const redactors: Array<[RegExp, string]> = [];
+    for (const artifact of this.tools.registeredArtifactPaths()) {
+      const token = `<artifact:${artifact.ref}>`;
+      redactors.push([new RegExp(escapeRegExp(artifact.path), "g"), token]);
+      redactors.push([new RegExp(escapeRegExp(artifact.path.split("/").join("\\")), "g"), token]);
+      redactors.push([new RegExp(escapeRegExp(artifact.path.toLowerCase()), "gi"), token]);
+      redactors.push([
+        new RegExp(escapeRegExp(artifact.path.split("/").join("\\").toLowerCase()), "gi"),
+        token
+      ]);
+    }
+    const replacer = (text: string): string => {
+      let out = text;
+      for (const [pattern, token] of redactors) out = out.replace(pattern, token);
+      // Workspace/staging fragments that never matched a registered
+      // artifact path (candidate staging, temp files).
+      const workspacePattern = /[A-Za-z]:\\[^"']*?\.office-runtime[^"']*/gi;
+      out = out.replace(workspacePattern, "<workspace>");
+      return out;
+    };
+    return JSON.parse(
+      JSON.stringify(value, (_key, val) => (typeof val === "string" ? replacer(val) : val))
+    ) as T;
   }
 
   private respondOk(id: number | string | null, result: unknown, output: NodeJS.WritableStream): void {

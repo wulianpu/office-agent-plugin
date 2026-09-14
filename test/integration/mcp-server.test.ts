@@ -110,6 +110,55 @@ describe("MCP stdio server (wire protocol)", () => {
     expect(parsed.offline).toBe(true);
   });
 
+  it("INV-12 boundary: error/timeout messages carrying PHYSICAL paths never reach the Agent wire (issue #7)", async () => {
+    // Register an artifact so its real path participates in redaction.
+    const ref = await ws.plugin.registerArtifact(join(ws.root, "wire.docx"));
+    const realPath = ws.plugin.service.store.resolvePath(ref);
+
+    // Inject an engine failure whose message embeds the real path (the exact
+    // OfficeCLI timeout/argv shape the adapter used to emit).
+    const originalGet = ws.plugin.mcpTools["service"].officecli.get.bind(
+      ws.plugin.mcpTools["service"].officecli
+    );
+    const session = await ws.plugin.openSession(ref);
+    ws.plugin.mcpTools["service"].officecli.get = async () => {
+      throw Object.assign(
+        new Error(`officecli timed out: officecli node get ${realPath} /body --json`),
+        { code: "timeout" }
+      );
+    };
+    try {
+      request({
+        jsonrpc: "2.0",
+        id: 41,
+        method: "tools/call",
+        params: { name: "office.inspect", arguments: { sessionId: session.sessionId, path: "/body" } }
+      });
+      const envelope = await awaitResponse(41);
+      const text = envelope.result?.content?.[0]?.text ?? "";
+      expect(text).not.toContain(realPath); // no physical path on the wire
+      expect(text).not.toContain(realPath.replaceAll("/", "\\")); // backslash variant
+      expect(text).not.toContain(realPath.toLowerCase()); // case variant
+      expect(text).toContain("artifact:"); // capability token replaces it
+      expect(text).toContain("timed out"); // the typed reason survives
+    } finally {
+      ws.plugin.mcpTools["service"].officecli.get = originalGet;
+      await ws.plugin.closeSession(session.sessionId).catch(() => undefined);
+    }
+
+    // The SAME boundary covers success payloads (regression for the
+    // pre-existing success-path sanitize now living at the transport).
+    request({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "tools/call",
+      params: { name: "office.capabilities", arguments: {} }
+    });
+    const successEnvelope = await awaitResponse(42);
+    const successText = successEnvelope.result?.content?.[0]?.text ?? "";
+    expect(successText).not.toContain(ws.root); // no workspace path either
+  });
+
   it("tools/call with an unknown tool returns isError, not a protocol error", async () => {
     request({
       jsonrpc: "2.0",

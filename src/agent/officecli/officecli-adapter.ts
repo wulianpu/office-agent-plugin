@@ -150,7 +150,16 @@ export class OfficeCliAdapter {
       let stderr = "";
       const timeout = setTimeout(() => {
         child.kill();
-        rejectPromise(new OfficeCliError("timeout", `officecli timed out: officecli ${args.join(" ")}`));
+        // P1-high (#7, INV-12): the timeout message must NOT splice the full
+        // argv — it carries canonicalized PHYSICAL file paths. Subcommand +
+        // bounded argument count only; detailed argv stays in local
+        // diagnostics (the call site label), never in the error surface.
+        rejectPromise(
+          new OfficeCliError(
+            "timeout",
+            `officecli timed out after ${this.options.timeoutMs ?? 120_000}ms: officecli ${resolvedCommand.baseArgs.join(" ")} ${args[0] ?? ""} (${args.length} args)`
+          )
+        );
       }, this.options.timeoutMs ?? 120_000);
 
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));

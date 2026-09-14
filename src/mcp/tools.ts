@@ -27,6 +27,12 @@ import type { PreviewOutline } from "../contracts/preview.js";
 export class OfficeMcpTools {
   constructor(private readonly service: OfficeRuntimeService) {}
 
+  /** P1-high (#7): the transport's final INV-12 redaction needs the same
+   *  registered-artifact list the success-path sanitizer uses. */
+  registeredArtifactPaths(): Array<{ ref: string; path: string }> {
+    return this.service.repos.loadArtifacts().map((a) => ({ ref: a.ref, path: a.path }));
+  }
+
   /** Sanitize output: physical paths never leave the runtime (INV-12). */
   private sanitize<T>(value: T): T {
     const replacer = (text: string): string => {
