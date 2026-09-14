@@ -298,7 +298,25 @@ export class SessionManager {
     for (const row of this.repos.listOpenSessions()) {
       if (this.sessions.has(row.session_id)) continue;
       const revision = this.revisions.latest(row.session_id);
-      if (!revision) continue;
+      if (!revision) {
+        // P1 (#9): a crash between the initial session row's `ready` write
+        // and the first committed revision leaves an open-but-unmaterialized
+        // row that every restart would list and skip forever. Mark it
+        // closed/abandoned once, with a durable diagnostic — no zombie
+        // accumulation, and documentId resolution stops seeing it.
+        this.repos.upsertSession({
+          sessionId: row.session_id,
+          documentId: row.document_id,
+          artifactRef: row.artifact_ref,
+          format: row.format as OfficeFormat,
+          backend: row.backend as DocumentSession["backend"],
+          lifecycle: "closed",
+          epoch: row.epoch,
+          createdAt: row.created_at,
+          closedAt: Date.now()
+        });
+        continue;
+      }
       const session: DocumentSession = {
         sessionId: row.session_id,
         documentId: row.document_id,
@@ -324,6 +342,37 @@ export class SessionManager {
       count++;
     }
     return count;
+  }
+
+  /**
+   * P1-high (#9): candidate reconciliation — rebind the persisted ACTIVE
+   * candidate to its rehydrated session BEFORE any recovery-required →
+   * ready transition, so Human/Agent/Accept all see ONE ownership fact.
+   * Fail-closed policy per crash-time state:
+   *  - ready / human-amended: rebound for review/accept (their verification
+   *    facts re-checked at accept time);
+   *  - preparing / mutating / flushing / verifying: the resident/in-memory
+   *    task died with the process — never blind-resumed; marked failed with
+   *    an explicit recovery reason so the session can start fresh.
+   */
+  reconcileRecoveredCandidates(): { rebound: number; abandoned: number } {
+    let rebound = 0;
+    let abandoned = 0;
+    for (const [sessionId, entry] of [...this.sessions]) {
+      const active = this.repos.activeCandidateForSession(sessionId);
+      if (!active) continue;
+      if (active.state === "ready" || active.state === "human-amended") {
+        entry.session.candidate = active;
+        rebound++;
+      } else {
+        // In-flight writer states cannot survive the process; quarantine as
+        // failed with an explicit reason (staging left in place for the
+        // eviction ladder / manual review).
+        this.repos.upsertCandidate({ ...active, state: "failed", failureReason: "recovered-after-crash: in-flight mutation state cannot resume", updatedAt: Date.now() });
+        abandoned++;
+      }
+    }
+    return { rebound, abandoned };
   }
 
   private async resolveOrCreateDocumentId(artifactRef: ArtifactRef): Promise<DocumentId> {

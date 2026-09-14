@@ -271,7 +271,22 @@ export class OfficeRuntimeService {
     await this.recovery.recoverAll();
     const rehydrated = this.sessions.rehydrateFromDb();
     if (rehydrated > 0) {
-      void rehydrated;
+      // P1-high (#9): candidate reconciliation BEFORE anything can move a
+      // session back to ready — Human edit, Agent begin and Accept all see
+      // the same single ownership fact afterwards.
+      const reconciled = this.sessions.reconcileRecoveredCandidates();
+      void reconciled;
+      // P1-high (#9): every rehydrated open session rejoins the
+      // SourceWatcher ref-count — a recovered-then-ready session must not
+      // sit unobserved while external saves land on the source.
+      for (const session of this.sessions.list()) {
+        if (session.lifecycle !== "recovery-required") continue;
+        try {
+          this.watcher.watchFile(this.store.resolvePath(session.artifactRef));
+        } catch {
+          // Best-effort conflict observation; strong hash gates remain.
+        }
+      }
     }
     this.watcher.onMutation((event) => {
       void this.handleSourceMutation(event.sourcePath, event.kind);
@@ -617,6 +632,16 @@ export class OfficeRuntimeService {
     return this.sessions.actor(sessionId).enqueue(async () => {
       const live = this.sessions.require(sessionId);
       const candidate = this.candidates.require(candidateId);
+
+      // P1-high (#9): ownership — only the session's CURRENT proposal is
+      // acceptable. A stale persisted candidate whose base/hash happen to
+      // match cannot hijack the session after its writer moved on.
+      if (live.candidate?.candidateId !== candidateId) {
+        throw new OfficeRuntimeError(
+          "candidate-conflict",
+          `candidate ${candidateId} is not the current proposal of session ${sessionId} (bound: ${live.candidate?.candidateId ?? "none"})`
+        );
+      }
 
       if (live.writerLease) {
         throw new OfficeRuntimeError("lease-held", "a writer still holds the session lease");

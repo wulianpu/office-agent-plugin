@@ -81,6 +81,16 @@ export class AgentRuntime {
     const baseRevision = await this.deps.sessions.ensureStrongIdentity(sessionId);
     const captured = await this.deps.sessions.actor(sessionId).enqueue(async () => {
       const live = this.deps.sessions.require(sessionId);
+      // P1-high (#9): the durable candidate fact gates new tasks — a
+      // rehydrated session whose candidate was reconciled from the DB is
+      // respected even before any in-memory binding refresh.
+      const active = this.deps.candidates.activeForSession(sessionId);
+      if (active && active.state !== "failed" && active.state !== "committing") {
+        throw new OfficeRuntimeError(
+          "candidate-conflict",
+          `session already has an active candidate ${active.candidateId} in state ${active.state}`
+        );
+      }
       if (live.candidate && live.candidate.state !== "failed" && live.candidate.state !== "committing") {
         throw new OfficeRuntimeError(
           "candidate-conflict",
