@@ -101,6 +101,24 @@ export class ArtifactStore {
    * Candidate clone (§66): copy-on-write semantics via full copy fallback —
    * hard links are never used for isolation.
    */
+  /**
+   * P1-high (#6 reopen): release a staging artifact — best-effort physical
+   * delete + registration removal. Used by task-prepare rollbacks so a
+   * failed begin never orphans staging bytes.
+   */
+  async releaseStaging(ref: ArtifactRef): Promise<void> {
+    try {
+      const row = this.byRef.get(ref);
+      if (!row || row.kind !== "staging") return;
+      await removeQuiet(row.path);
+      this.byRef.delete(ref);
+      await this.persistence?.deleteArtifact(ref).catch(() => undefined);
+    } catch {
+      // Best-effort: the eviction ladder and startup purge remain the
+      // final safety net for anything this path cannot remove.
+    }
+  }
+
   async createStagingCopy(sourceRef: ArtifactRef): Promise<ArtifactRef> {
     const sourcePath = this.resolvePath(sourceRef);
     const stagingRef = newArtifactRef();

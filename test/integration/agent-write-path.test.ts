@@ -256,6 +256,69 @@ describe.skipIf(!engineUp)("Agent mutation concurrency & session teardown (issue
   });
 });
 
+describe.skipIf(!engineUp)("Agent close/mutation linearization (issue #6 reopen)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+    ws = await openWorkspace();
+    pptxPath = await fixture.pptx(ws.root);
+  });
+
+  it("close while the mutation is queued behind a lane: zero engine dispatch after close", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    const task = await ws.plugin.beginAgentTask(session.sessionId, { intent: "lane close", destructiveAllowed: false });
+    // First mutation blocks the lane (gated adapter not needed — the engine
+    // round-trip itself is the visible delay); a second queues behind it.
+    const first = ws.plugin.executeAgentMutation(task, {
+      commandId: "cmd-lc-1",
+      idempotencyKey: "lc-1",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Lane First" } }]
+    });
+    void first.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = ws.plugin.executeAgentMutation(task, {
+      commandId: "cmd-lc-2",
+      idempotencyKey: "lc-2",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Must Not Run" } }]
+    });
+    void second.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    await ws.plugin.closeSession(session.sessionId); // closing gate + lane drain
+    const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+    // closeSession drains the lane: first may complete (it was in flight),
+    // the queued second must be rejected BEFORE any engine side effect.
+    expect(secondResult.status === "rejected").toBe(true);
+    void firstResult;
+    expect(ws.plugin.service.repos.countIdempotencyExecutions(task.candidateId, "lc-2")).toBe(0);
+    expect(ws.plugin.service.agent.activeTaskCount()).toBe(0);
+    expect(ws.plugin.service.agent.residentCount()).toBe(0);
+  });
+
+  it("mutation after flush→verify is rejected: the capability is revoked at the verifying window", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    const task = await ws.plugin.beginAgentTask(session.sessionId, { intent: "flush gate", destructiveAllowed: false });
+    await ws.plugin.executeAgentMutation(task, {
+      commandId: "cmd-fg-1",
+      idempotencyKey: "fg-1",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Before Flush" } }]
+    });
+    await ws.plugin.flushAgentCandidate(task); // candidate now `verifying`
+    await expect(
+      ws.plugin.executeAgentMutation(task, {
+        commandId: "cmd-fg-2",
+        idempotencyKey: "fg-2",
+        payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "After Verify" } }]
+      })
+    ).rejects.toMatchObject({ code: "candidate-not-ready" });
+    expect(ws.plugin.service.repos.countIdempotencyExecutions(task.candidateId, "fg-2")).toBe(0);
+    await ws.plugin.finalizeAgentTask(task);
+    await ws.plugin.rejectCandidate(session.sessionId);
+    await ws.plugin.closeSession(session.sessionId);
+  });
+});
+
 describe.skipIf(!engineUp || process.platform !== "win32")(
   "Windows 8.3 short-path hardening (round 8)",
   () => {

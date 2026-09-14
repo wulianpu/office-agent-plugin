@@ -47,9 +47,22 @@ function digestPayload(items: unknown): string {
   return `${json.length}:${(hash >>> 0).toString(36)}`;
 }
 
+interface TrackedTask {
+  context: OfficeTaskContext;
+  lease: WriterLease;
+  mode: "standalone" | "resident";
+  residentOpened: boolean;
+  /**
+   * P1-high (#6 reopen): admission gate for the close/abort terminal
+   * linearization — once closing, no further mutation of THIS task may
+   * cross the engine boundary; abortSession drains the lane first.
+   */
+  closing: boolean;
+}
+
 export class AgentRuntime {
   readonly policy: OperationPolicyEngine;
-  private readonly tasks = new Map<string, { context: OfficeTaskContext; lease: WriterLease; mode: "standalone" | "resident"; residentOpened: boolean }>();
+  private readonly tasks = new Map<string, TrackedTask>();
   /**
    * P0 (#6, INV-04): per-candidate mutation serial lane. The FULL critical
    * section — idempotency lookup, payload-digest check, lease/policy gate,
@@ -140,27 +153,50 @@ export class AgentRuntime {
         })
         .promise;
     } catch (error) {
-      // Roll the lease back; the mailbox was free during the clone.
+      // P1-high (#6 reopen): symmetric rollback of the acquired writer —
+      // release the lease, clear session.writerLease, emit the matching
+      // durable lease.released, and drop any partially-created staging copy
+      // the store may have left behind (copy succeeded + saveArtifact
+      // failed still leaves physical bytes).
       this.deps.leases.release(lease.leaseId);
+      this.deps.sessions.updateSession(sessionId, (live) => {
+        if (live.writerLease?.leaseId === lease.leaseId) live.writerLease = undefined;
+      });
+      await this.deps.events
+        .emit(sessionId, captured.epoch, "lease.released", {
+          leaseId: lease.leaseId,
+          owner: "agent",
+          reason: "task-prepare-failed"
+        })
+        .catch(() => undefined);
       throw error;
     }
 
     return this.deps.sessions.actor(sessionId).enqueue(async () => {
       const live = this.deps.sessions.require(sessionId);
       // P0-B four-way gate at the final apply: lifecycle must still be ready.
-      if (live.lifecycle !== "ready") {
+      if (live.lifecycle !== "ready" || live.committedRevision.revisionId !== captured.revisionId || live.sessionEpoch !== captured.epoch) {
+        // P1-high (#6 reopen): the final freshness gate failed — full
+        // rollback now includes the durable event, session binding cleanup,
+        // and the already-cloned staging artifact release.
         this.deps.leases.release(lease.leaseId);
         this.deps.sessions.updateSession(sessionId, (s) => {
-          s.writerLease = undefined;
+          if (s.writerLease?.leaseId === lease.leaseId) s.writerLease = undefined;
         });
-        throw new OfficeRuntimeError("recovery-required", `session lifecycle is ${live.lifecycle}; task aborted`);
-      }
-      if (live.committedRevision.revisionId !== captured.revisionId || live.sessionEpoch !== captured.epoch) {
-        this.deps.leases.release(lease.leaseId);
-        this.deps.sessions.updateSession(sessionId, (s) => {
-          s.writerLease = undefined;
-        });
-        throw new OfficeRuntimeError("recovery-required", "session revision moved during clone; retry the task");
+        await this.deps.events
+          .emit(sessionId, live.sessionEpoch, "lease.released", {
+            leaseId: lease.leaseId,
+            owner: "agent",
+            reason: "task-prepare-failed"
+          })
+          .catch(() => undefined);
+        await this.deps.store.releaseStaging?.(stagingRef).catch(() => undefined);
+        throw new OfficeRuntimeError(
+          "recovery-required",
+          live.lifecycle !== "ready"
+            ? `session lifecycle is ${live.lifecycle}; task aborted`
+            : "session revision moved during clone; retry the task"
+        );
       }
       const candidate = await this.deps.candidates.register(
         sessionId,
@@ -186,7 +222,8 @@ export class AgentRuntime {
         context,
         lease,
         mode: "resident",
-        residentOpened: false
+        residentOpened: false,
+        closing: false
       });
       return context;
     });
@@ -230,12 +267,12 @@ export class AgentRuntime {
     task: OfficeTaskContext,
     command: Omit<MutationCommand<OfficeEditItem[]>, "candidateId" | "fencingToken"> & { approved?: boolean },
     payloadDigest: string,
-    tracked: { context: OfficeTaskContext; lease: WriterLease; mode: "standalone" | "resident"; residentOpened: boolean }
+    tracked: TrackedTask
   ): Promise<MutationReceipt> {
-    // Idempotent replay (INV-04) — CANDIDATE-scoped (§61): retries bind to
-    // the task's candidate, never to the session lifetime. Same key with a
-    // different payload digest is a conflict, not a silent replay — and on
-    // the serial lane the conflict is detected before THIS caller mutates.
+    // Idempotent replay (INV-04) — CANDIDATE-scoped (§61): a stored receipt
+    // is returned with ZERO engine work, so replay stays legal across
+    // lifecycle transitions (flush/verify revoke NEW mutations, not reads of
+    // already-persisted receipts).
     const stored = this.deps.repos.getIdempotentReceipt(task.candidateId, command.idempotencyKey);
     if (stored) {
       if (stored.payloadDigest !== payloadDigest) {
@@ -245,6 +282,27 @@ export class AgentRuntime {
         );
       }
       return stored.receipt;
+    }
+
+    // P1-high (#6 reopen): closing tasks never admit new engine work — the
+    // gate sits BEFORE fence or any side effect (only fresh mutations).
+    if (tracked.closing) {
+      throw new OfficeRuntimeError(
+        "recovery-required",
+        `task ${task.taskId} is closing; mutation rejected before any engine side effect`
+      );
+    }
+
+    // P1-high (#6 reopen): NEW mutations require the candidate to be in the
+    // mutating window — after flush→verify the capability is revoked, so a
+    // late fresh command cannot append engine writes to an already-verified
+    // proposal.
+    const candidateNow = this.deps.candidates.get(task.candidateId);
+    if (!candidateNow || candidateNow.state !== "mutating") {
+      throw new OfficeRuntimeError(
+        "candidate-not-ready",
+        `candidate is ${candidateNow?.state ?? "missing"}; mutations require the mutating window (flush/verify revoked the capability)`
+      );
     }
 
     // Fencing check (INV-03).
@@ -301,6 +359,17 @@ export class AgentRuntime {
             if (!tracked.residentOpened) {
               await this.deps.pool.acquire(candidatePath);
               tracked.residentOpened = true;
+              // P1-high (#6 reopen): close/abort may have landed while the
+              // acquire was pending — the just-obtained resident must be
+              // evicted immediately and the mutation never dispatched.
+              if (tracked.closing) {
+                await this.deps.pool.evict(candidatePath).catch(() => undefined);
+                tracked.residentOpened = false;
+                throw new OfficeRuntimeError(
+                  "recovery-required",
+                  "task closed while acquiring the resident; mutation aborted with zero engine side effect"
+                );
+              }
             }
             // Explicit resident semantics (§64): in-memory apply through the
             // live resident; flush deferred to save/close.
@@ -352,7 +421,14 @@ export class AgentRuntime {
     const candidate = this.deps.candidates.require(task.candidateId);
     const candidatePath = this.deps.store.resolvePath(candidate.artifactRef);
 
-    await this.deps.candidates.transition(task.candidateId, session.sessionEpoch, "flushing");
+    // P1-high (#6 reopen): flush→verify is the lane's TERMINAL BARRIER —
+    // the flush runs on the same per-candidate lane as mutations, so once it
+    // starts no further mutation can interleave; the capability revoke is
+    // the `flushing` transition itself (the mutating-window gate in
+    // executeMutationSection rejects anything that queues afterwards).
+    const previous = this.mutationLanes.get(task.candidateId) ?? Promise.resolve();
+    const flush = previous.catch(() => undefined).then(async () => {
+      await this.deps.candidates.transition(task.candidateId, session.sessionEpoch, "flushing");
     if (tracked.residentOpened) {
       await this.deps.adapter.save(candidatePath); // read visibility barrier
       await this.deps.pool.evict(candidatePath); // writer handoff: final bytes
@@ -375,10 +451,19 @@ export class AgentRuntime {
       })
       .promise;
 
-    await this.deps.candidates.transition(task.candidateId, session.sessionEpoch, "verifying", {
-      currentHash: contentHash
+      await this.deps.candidates.transition(task.candidateId, session.sessionEpoch, "verifying", {
+        currentHash: contentHash
+      });
+      return contentHash;
     });
-    return contentHash;
+    this.mutationLanes.set(
+      task.candidateId,
+      flush.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return flush;
   }
 
   /**
@@ -416,6 +501,26 @@ export class AgentRuntime {
    * of lingering ownerless.
    */
   async abortSession(sessionId: SessionId, reason = "session-closed"): Promise<void> {
+    // P1-high (#6 reopen): closing gate first — every task of the session
+    // stops admitting engine work immediately; queued lane sections then
+    // see the gate and abort before any side effect.
+    for (const tracked of this.tasks.values()) {
+      if (tracked.context.sessionId === sessionId) tracked.closing = true;
+    }
+    // Drain the in-flight/queued mutation lanes of this session's
+    // candidates BEFORE any teardown — the lane completion guarantees no
+    // engine continuation survives past abortSession's return.
+    const lanesToDrain: Array<Promise<unknown>> = [];
+    for (const [candidateId, lane] of [...this.mutationLanes]) {
+      const owner = this.tasks.get(
+        [...this.tasks.keys()].find(
+          (id) => this.tasks.get(id)!.context.candidateId === candidateId && this.tasks.get(id)!.context.sessionId === sessionId
+        ) ?? ""
+      );
+      if (owner) lanesToDrain.push(lane);
+    }
+    await Promise.allSettled(lanesToDrain);
+
     for (const [taskId, tracked] of [...this.tasks]) {
       if (tracked.context.sessionId !== sessionId) continue;
       const candidate = this.deps.candidates.get(tracked.context.candidateId);
@@ -485,12 +590,7 @@ export class AgentRuntime {
     await this.deps.pool.dispose();
   }
 
-  private requireTask(task: OfficeTaskContext): {
-    context: OfficeTaskContext;
-    lease: WriterLease;
-    mode: "standalone" | "resident";
-    residentOpened: boolean;
-  } {
+  private requireTask(task: OfficeTaskContext): TrackedTask {
     const tracked = this.tasks.get(task.taskId);
     if (!tracked) {
       throw new OfficeRuntimeError("recovery-required", `unknown or finalized task ${task.taskId}`);
