@@ -54,11 +54,27 @@ export class AtomicFileCommitter {
   ) {}
 
   /**
+   * Test seam for the physical rename call (default node:fs rename) —
+   * deterministic fault injection for the Windows lock-retry path (#5 P0-1).
+   */
+  protected renameAttempt: (tempPath: string, sourcePath: string) => Promise<void> = (tempPath, sourcePath) =>
+    rename(tempPath, sourcePath);
+
+  /**
    * Windows replace with lock-resilient retry: engine daemons or AV scanners
    * holding the destination clear within a few hundred ms; a releaser hook
    * (officecli close) resolves persistent engine residents.
+   *
+   * P0-1 (#5 reopen): the INV-10 source seal runs before EVERY rename
+   * attempt — the retry waits (120..1200ms) plus lock releaser re-open a
+   * multi-second window in which an external save can land; sealing only
+   * once before the loop let that save be silently overwritten by a later
+   * successful attempt. A mismatch stops all retries (typed
+   * source-mutated / artifact-missing) so the external bytes survive. The
+   * residual race shrinks back to the unavoidable gap between one hash
+   * syscall and the immediately following rename.
    */
-  private async replaceAtomically(tempPath: string, sourcePath: string): Promise<void> {
+  private async replaceAtomically(tempPath: string, sourcePath: string, expectedSourceHash: string): Promise<void> {
     const attempts = [
       { wait: 0 },
       { wait: 120 },
@@ -74,8 +90,27 @@ export class AtomicFileCommitter {
       if (attempt.release && this.lockReleaser) {
         await this.lockReleaser(sourcePath).catch(() => undefined);
       }
+      // Per-attempt source seal: the bytes we are about to overwrite must
+      // still be the bytes this commit was authorized against.
+      const sealed = await sha256File(sourcePath).catch(() => undefined);
+      if (sealed === undefined) {
+        throw new OfficeRuntimeError(
+          "artifact-missing",
+          "source vanished before replace attempt: " + sourcePath
+        );
+      }
+      if (sealed !== expectedSourceHash) {
+        throw new OfficeRuntimeError(
+          "source-mutated",
+          "source changed during replace retries (per-attempt seal): expected " +
+            expectedSourceHash +
+            ", found " +
+            sealed +
+            " — external bytes preserved"
+        );
+      }
       try {
-        await rename(tempPath, sourcePath);
+        await this.renameAttempt(tempPath, sourcePath);
         return;
       } catch (error) {
         lastError = error;
@@ -144,33 +179,20 @@ export class AtomicFileCommitter {
       );
     }
 
-    // ── P0 source seal (#5): the authoritative INV-10 check moves to the
-    // last gate before the replace. The early check above can pass and an
-    // external Word/WPS/sync save can still land inside the copy + fsync +
-    // journal window; that external version must survive untouched instead
-    // of being silently overwritten by the rename. (A residual OS-level
-    // race between this check and the rename syscall remains — no
-    // cross-platform hash-CAS-rename primitive exists — but the large
-    // window is closed.)
-    const finalSourceHash = await sha256File(request.sourcePath).catch(() => undefined);
-    if (finalSourceHash === undefined) {
-      await this.cleanupTemp(record);
-      await this.journal(record, "aborted");
-      throw new OfficeRuntimeError(
-        "artifact-missing",
-        `source vanished before replace: ${request.sourcePath}`
-      );
+    // ── P0 source seal (#5 reopen): the authoritative INV-10 check now runs
+    // before EVERY replace attempt inside replaceAtomically (see its
+    // comment) — a typed source-mutated/artifact-mismatch stops the retries
+    // with journal/temp semantics preserved below.
+    try {
+      await this.replaceAtomically(tempPath, request.sourcePath, request.expectedSourceHash);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "source-mutated" || code === "artifact-missing") {
+        await this.cleanupTemp(record);
+        await this.journal(record, "aborted");
+      }
+      throw error;
     }
-    if (finalSourceHash !== request.expectedSourceHash) {
-      await this.cleanupTemp(record);
-      await this.journal(record, "aborted");
-      throw new OfficeRuntimeError(
-        "source-mutated",
-        `source changed during commit (pre-replace seal): expected ${request.expectedSourceHash}, found ${finalSourceHash} — external bytes preserved`
-      );
-    }
-
-    await this.replaceAtomically(tempPath, request.sourcePath);
     await fsyncFile(request.sourcePath);
     // P1 hardening: POSIX parent-dir fsync makes the rename durable across
     // OS crash / sudden power loss (not just process crash). Windows

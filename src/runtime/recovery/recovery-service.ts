@@ -70,6 +70,15 @@ export class RecoveryService {
     }
 
     if (record.phase === "prepared" || record.phase === "temp-ready") {
+      // P0-2 (#5 reopen) phase regression: the journal sits at temp-ready but
+      // the source already holds EXACTLY the candidate bytes — the durable
+      // phase lagged the filesystem (pre-FULL durability split, or an
+      // injected/legacy state). This must never be swallowed as an external
+      // mutation abort: forward-finalize through the SAME atomic path as
+      // SOURCE_REPLACED, preserving the exact commit_id binding.
+      if (record.phase === "temp-ready" && sourceHash === record.candidateHash) {
+        return await this.forwardFinalize(record);
+      }
       // Replace never happened: source at base hash → safe rollback.
       if (sourceHash === record.sourceHashBefore) {
         await this.committer.cleanupTemp(record as never);
@@ -98,61 +107,7 @@ export class RecoveryService {
     if (record.phase === "source-replaced") {
       // Replace happened; hash facts decide.
       if (sourceHash === record.candidateHash) {
-        // ── P0-1: use the SAME atomic finalization as the normal committer.
-        // revision.prepare → finalizeCommitAtomically → journal FINALIZED in
-        // ONE transaction. No crash window between insert and phase flip.
-        let artifactRef: string;
-        try {
-          artifactRef = await this.resolveArtifactRef(record.sourcePath);
-        } catch {
-          // P1-high: the physical commit ALREADY replaced the source — this
-          // is recovery-blocked, NOT aborted. Keep the journal unresolved so
-          // the next recovery (or manual intervention) can finalize once the
-          // artifact becomes registrable.
-          await this.emit(record.sessionId, {
-            commitId: record.commitId,
-            resolution: "conflict",
-            reason: "source-unregistrable-recovery-blocked"
-          });
-          return {
-            commitId: record.commitId,
-            resolution: "conflict",
-            reason: "source-unregistrable-recovery-blocked"
-          };
-        }
-
-        const journalRecord = this.repos.getJournal(record.commitId);
-        if (!journalRecord) {
-          return { commitId: record.commitId, resolution: "conflict", reason: "journal-vanished" };
-        }
-
-        // v3 exact-commit idempotency: "has THIS commit landed a revision?"
-        // is decided by commit_id identity — NEVER by content hash. A→B→A
-        // same-origin commits each land their own revision; a content-hash
-        // match against history would swallow the newest revision and lose
-        // the sequence.
-        const existing = this.revisions.getRevisionByCommitId(record.commitId);
-        if (!existing) {
-          const revision = this.revisions.prepare({
-            sessionId: record.sessionId,
-            artifactRef,
-            contentHash: record.candidateHash,
-            origin: record.origin as "human" | "agent" | "external",
-            commitId: record.commitId
-          });
-          this.repos.finalizeCommitAtomically(revision, journalRecord);
-        } else {
-          // The revision for THIS exact commit exists but the journal never
-          // flipped (injected/legacy state) — atomic identity-proven flip.
-          this.repos.markJournalFinalized(record.commitId);
-        }
-
-        await this.emit(record.sessionId, {
-          commitId: record.commitId,
-          resolution: "finalized",
-          contentHash: record.candidateHash
-        });
-        return { commitId: record.commitId, resolution: "finalized", contentHash: record.candidateHash };
+        return await this.forwardFinalize(record);
       }
       if (sourceHash === record.sourceHashBefore) {
         // Journal says replaced but source is at base → rollback.
@@ -179,6 +134,72 @@ export class RecoveryService {
     }
 
     return { commitId: record.commitId, resolution: "conflict", reason: `unknown phase ${record.phase}` };
+  }
+
+  /**
+   * P0-1 / P0-2 (#5): the shared forward-finalization path for
+   * SOURCE_REPLACED and the temp-ready phase regression — revision +
+   * journal FINALIZED in ONE transaction, exact commit_id identity.
+   */
+  private async forwardFinalize(record: {
+    commitId: string;
+    sessionId: string;
+    sourcePath: string;
+    candidateHash: string;
+    origin: string;
+  }): Promise<RecoveryOutcome> {
+    let artifactRef: string;
+    try {
+      artifactRef = await this.resolveArtifactRef(record.sourcePath);
+    } catch {
+      // P1-high: the physical commit ALREADY replaced the source — this
+      // is recovery-blocked, NOT aborted. Keep the journal unresolved so
+      // the next recovery (or manual intervention) can finalize once the
+      // artifact becomes registrable.
+      await this.emit(record.sessionId, {
+        commitId: record.commitId,
+        resolution: "conflict",
+        reason: "source-unregistrable-recovery-blocked"
+      });
+      return {
+        commitId: record.commitId,
+        resolution: "conflict",
+        reason: "source-unregistrable-recovery-blocked"
+      };
+    }
+
+    const journalRecord = this.repos.getJournal(record.commitId);
+    if (!journalRecord) {
+      return { commitId: record.commitId, resolution: "conflict", reason: "journal-vanished" };
+    }
+
+    // v3 exact-commit idempotency: "has THIS commit landed a revision?"
+    // is decided by commit_id identity — NEVER by content hash. A→B→A
+    // same-origin commits each land their own revision; a content-hash
+    // match against history would swallow the newest revision and lose
+    // the sequence.
+    const existing = this.revisions.getRevisionByCommitId(record.commitId);
+    if (!existing) {
+      const revision = this.revisions.prepare({
+        sessionId: record.sessionId,
+        artifactRef,
+        contentHash: record.candidateHash,
+        origin: record.origin as "human" | "agent" | "external",
+        commitId: record.commitId
+      });
+      this.repos.finalizeCommitAtomically(revision, journalRecord);
+    } else {
+      // The revision for THIS exact commit exists but the journal never
+      // flipped (injected/legacy state) — atomic identity-proven flip.
+      this.repos.markJournalFinalized(record.commitId);
+    }
+
+    await this.emit(record.sessionId, {
+      commitId: record.commitId,
+      resolution: "finalized",
+      contentHash: record.candidateHash
+    });
+    return { commitId: record.commitId, resolution: "finalized", contentHash: record.candidateHash };
   }
 
   /**
