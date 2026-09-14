@@ -64,18 +64,24 @@ export class LeaseManager {
       sessionEpoch,
       acquiredAt: Date.now()
     };
+    // P1 (#6) persistence-first: the DB row is the single commit point. If
+    // the insert throws, NO in-memory writer exists — a failed acquire can
+    // never leave a phantom lease the runtime treats as active.
+    this.repos.insertLease(lease);
     this.active.set(sessionId, lease);
     this.bySource.set(sourceKey, lease);
-    this.repos.insertLease(lease);
     return lease;
   }
 
   release(leaseId: LeaseId): void {
     for (const [sessionId, lease] of this.active) {
       if (lease.leaseId === leaseId) {
+        // P1 (#6) persistence-first release: flip the durable audit row
+        // BEFORE freeing the in-memory slot — the next writer is only
+        // admitted after the DB agrees the previous one ended.
+        this.repos.releaseLease(leaseId);
         this.active.delete(sessionId);
         this.removeFromSourceIndex(lease);
-        this.repos.releaseLease(leaseId);
         return;
       }
     }
@@ -84,9 +90,9 @@ export class LeaseManager {
   releaseForSession(sessionId: SessionId): WriterLease | undefined {
     const lease = this.active.get(sessionId);
     if (lease) {
+      this.repos.releaseLease(lease.leaseId);
       this.active.delete(sessionId);
       this.removeFromSourceIndex(lease);
-      this.repos.releaseLease(lease.leaseId);
     }
     return lease;
   }

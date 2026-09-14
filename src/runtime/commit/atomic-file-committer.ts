@@ -37,11 +37,14 @@ export class AtomicFileCommitter {
   /** Optional lock releaser invoked when Windows rename hits EPERM/EBUSY. */
   lockReleaser?: (path: string) => Promise<void>;
   /**
-   * §141 fault injection (test-only): invoked after each journal phase lands.
-   * A hook that kills the process here reproduces a REAL crash at a commit
-   * phase boundary (stronger than fabricating journal rows by hand).
+   * §141 fault injection (test-only): invoked (awaited) after each journal
+   * phase lands and BEFORE the next commit step. A hook that kills the
+   * process here reproduces a REAL crash at a commit phase boundary
+   * (stronger than fabricating journal rows by hand); awaiting makes async
+   * injections (e.g. deleting the source mid-commit) deterministic relative
+   * to the subsequent pre-replace seals.
    */
-  faultHook?: (phase: CommitPhase, commitId: string) => void;
+  faultHook?: (phase: CommitPhase, commitId: string) => void | Promise<void>;
 
   constructor(
     private readonly repos: RuntimeRepositories,
@@ -222,9 +225,10 @@ export class AtomicFileCommitter {
   private async journal(record: CommitJournalRecord, phase: CommitPhase): Promise<void> {
     const updated = { ...record, phase, updatedAt: Date.now() };
     this.repos.upsertJournal(updated);
-    // §141: fire AFTER the phase is durable — a hook that kills the process
-    // here leaves the journal exactly at this phase boundary.
-    this.faultHook?.(phase, record.commitId);
+    // §141: fire AFTER the phase is durable and AWAIT it — a hook that
+    // kills the process here leaves the journal exactly at this phase
+    // boundary; an async hook completes before the next commit step.
+    await this.faultHook?.(phase, record.commitId);
     await this.events
       .emit(record.sessionId, 0, "commit.journal-updated", { commitId: record.commitId, phase })
       .catch(() => undefined);

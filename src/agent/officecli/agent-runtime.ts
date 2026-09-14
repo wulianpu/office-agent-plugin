@@ -50,6 +50,17 @@ function digestPayload(items: unknown): string {
 export class AgentRuntime {
   readonly policy: OperationPolicyEngine;
   private readonly tasks = new Map<string, { context: OfficeTaskContext; lease: WriterLease; mode: "standalone" | "resident"; residentOpened: boolean }>();
+  /**
+   * P0 (#6, INV-04): per-candidate mutation serial lane. The FULL critical
+   * section — idempotency lookup, payload-digest check, lease/policy gate,
+   * engine mutation, durable receipt persist — runs one-at-a-time per
+   * candidate. Concurrent same-key retries coalesce onto the first call's
+   * result (the joiner re-reads the persisted receipt), and same-key with a
+   * DIFFERENT payload conflicts before that caller's engine side effect.
+   * `INSERT OR IGNORE` alone cannot provide this — DB uniqueness only lands
+   * after the side effect.
+   */
+  private readonly mutationLanes = new Map<string, Promise<unknown>>();
 
   constructor(private readonly deps: AgentRuntimeDeps) {
     this.policy = deps.policy ?? new OperationPolicyEngine();
@@ -174,6 +185,8 @@ export class AgentRuntime {
   /**
    * Execute an idempotent mutating command against the candidate (§61).
    * Same idempotencyKey replays the stored receipt instead of re-executing.
+   * P0 (#6): the whole section runs on the candidate's serial lane — see
+   * `mutationLanes`.
    */
   async executeMutation(
     task: OfficeTaskContext,
@@ -183,10 +196,36 @@ export class AgentRuntime {
     if (!tracked) {
       throw new OfficeRuntimeError("recovery-required", `unknown or finalized task ${task.taskId}`);
     }
+    const payloadDigest = digestPayload(command.payload);
+
+    // Serialize per candidate in CALL order — deterministic command ordering
+    // for different keys, and same-key retries see the just-persisted
+    // receipt of the first call (one engine execution, identical receipts).
+    const previous = this.mutationLanes.get(task.candidateId) ?? Promise.resolve();
+    const execution = previous
+      .catch(() => undefined)
+      .then(() => this.executeMutationSection(task, command, payloadDigest, tracked));
+    this.mutationLanes.set(
+      task.candidateId,
+      execution.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return execution;
+  }
+
+  /** The idempotency → policy → engine → persist critical section (P0 #6). */
+  private async executeMutationSection(
+    task: OfficeTaskContext,
+    command: Omit<MutationCommand<OfficeEditItem[]>, "candidateId" | "fencingToken"> & { approved?: boolean },
+    payloadDigest: string,
+    tracked: { context: OfficeTaskContext; lease: WriterLease; mode: "standalone" | "resident"; residentOpened: boolean }
+  ): Promise<MutationReceipt> {
     // Idempotent replay (INV-04) — CANDIDATE-scoped (§61): retries bind to
     // the task's candidate, never to the session lifetime. Same key with a
-    // different payload digest is a conflict, not a silent replay.
-    const payloadDigest = digestPayload(command.payload);
+    // different payload digest is a conflict, not a silent replay — and on
+    // the serial lane the conflict is detected before THIS caller mutates.
     const stored = this.deps.repos.getIdempotentReceipt(task.candidateId, command.idempotencyKey);
     if (stored) {
       if (stored.payloadDigest !== payloadDigest) {
@@ -356,6 +395,49 @@ export class AgentRuntime {
       s.writerLease = undefined;
     });
     this.tasks.delete(task.taskId);
+  }
+
+  /**
+   * P1-high (#6): session teardown for the agent write plane. closeSession
+   * calls this BEFORE the generic human-edit cleanup so an active task is
+   * fully reclaimed — resident evicted, agent lease released with the TRUE
+   * owner in the durable event, task/lane entries removed, and the abandoned
+   * candidate transitioned to an explicit observable `failed` state instead
+   * of lingering ownerless.
+   */
+  async abortSession(sessionId: SessionId, reason = "session-closed"): Promise<void> {
+    for (const [taskId, tracked] of [...this.tasks]) {
+      if (tracked.context.sessionId !== sessionId) continue;
+      const candidate = this.deps.candidates.get(tracked.context.candidateId);
+      const candidatePath = candidate ? this.deps.store.resolvePath(candidate.artifactRef) : undefined;
+      if (tracked.residentOpened && candidatePath) {
+        await this.deps.pool.evict(candidatePath).catch(() => undefined);
+        tracked.residentOpened = false;
+      }
+      const session = this.deps.sessions.get(sessionId);
+      const epoch = session?.sessionEpoch ?? tracked.lease.sessionEpoch;
+      if (candidate && candidate.state !== "failed" && candidate.state !== "committing") {
+        await this.deps.candidates
+          .markFailed(tracked.context.candidateId, epoch, `session closed: ${reason}`)
+          .catch(() => undefined);
+      }
+      this.deps.leases.release(tracked.lease.leaseId);
+      await this.deps.events
+        .emit(sessionId, epoch, "lease.released", {
+          leaseId: tracked.lease.leaseId,
+          owner: "agent",
+          reason
+        })
+        .catch(() => undefined);
+      if (session) {
+        this.deps.sessions.updateSession(sessionId, (s) => {
+          s.writerLease = undefined;
+          if (s.candidate?.candidateId === tracked.context.candidateId) s.candidate = undefined;
+        });
+      }
+      this.mutationLanes.delete(tracked.context.candidateId);
+      this.tasks.delete(taskId);
+    }
   }
 
   /** Resident on the candidate — exposed for memory telemetry/tests (§65). */

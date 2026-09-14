@@ -170,6 +170,92 @@ describe.skipIf(!engineUp)("Agent write path (§158)", () => {
   });
 });
 
+describe.skipIf(!engineUp)("Agent mutation concurrency & session teardown (issue #6)", () => {
+  beforeAll(async () => {
+    fixture = await createOfficeCliFixture();
+    ws = await openWorkspace();
+    pptxPath = await fixture.pptx(ws.root);
+  });
+
+  it("P0: two CONCURRENT same-key same-payload mutations execute once and return the same persisted receipt", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    const task = await ws.plugin.beginAgentTask(session.sessionId, { intent: "concurrent retry", destructiveAllowed: false });
+    const command = {
+      commandId: "cmd-concurrent-a",
+      idempotencyKey: "concurrent-retry-1",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Once Only" } }]
+    };
+    const [first, second] = await Promise.all([
+      ws.plugin.executeAgentMutation(task, command),
+      // Same idempotencyKey + same payload, different commandId — a true
+      // concurrent retry that previously double-executed.
+      ws.plugin.executeAgentMutation(task, { ...command, commandId: "cmd-concurrent-b" })
+    ]);
+    expect(first.receiptId).toBe(second.receiptId); // one persisted receipt
+    const executions = ws.plugin.service.repos.countIdempotencyExecutions(task.candidateId, "concurrent-retry-1");
+    expect(executions).toBe(1); // exactly one durable row
+    await ws.plugin.finalizeAgentTask(task);
+    await ws.plugin.rejectCandidate(session.sessionId);
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
+  it("P0: concurrent same-key DIFFERENT-payload — one payload executes, the other conflicts with zero side effect", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    const task = await ws.plugin.beginAgentTask(session.sessionId, { intent: "conflict race", destructiveAllowed: false });
+    const results = await Promise.allSettled([
+      ws.plugin.executeAgentMutation(task, {
+        commandId: "cmd-race-1",
+        idempotencyKey: "race-key",
+        payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Payload One" } }]
+      }),
+      ws.plugin.executeAgentMutation(task, {
+        commandId: "cmd-race-2",
+        idempotencyKey: "race-key",
+        payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Payload Two" } }]
+      })
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ code: "idempotency-conflict" });
+    expect(ws.plugin.service.repos.countIdempotencyExecutions(task.candidateId, "race-key")).toBe(1);
+    await ws.plugin.finalizeAgentTask(task);
+    await ws.plugin.rejectCandidate(session.sessionId);
+    await ws.plugin.closeSession(session.sessionId);
+  });
+
+  it("P1-high: closeSession fully reclaims an ACTIVE agent task — resident, lease (owner=agent), candidate", async () => {
+    const ref = await ws.plugin.registerArtifact(pptxPath);
+    const session = await ws.plugin.openSession(ref);
+    const task = await ws.plugin.beginAgentTask(session.sessionId, { intent: "teardown", destructiveAllowed: false });
+    await ws.plugin.executeAgentMutation(task, {
+      commandId: "cmd-teardown",
+      idempotencyKey: "teardown-1",
+      payload: [{ command: "set", path: "/slide[1]/shape[1]", props: { text: "Will Be Abandoned" } }]
+    });
+    // The mutation opened the engine resident for the candidate.
+    expect(ws.plugin.service.agent.residentCount()).toBe(1);
+    expect(ws.plugin.service.agent.activeTaskCount()).toBe(1);
+
+    await ws.plugin.closeSession(session.sessionId);
+
+    expect(ws.plugin.service.agent.activeTaskCount()).toBe(0); // task reclaimed
+    expect(ws.plugin.service.agent.residentCount()).toBe(0); // resident evicted
+    expect(ws.plugin.service.leases.hasActiveLease(session.sessionId)).toBe(false);
+    // The durable audit records the TRUE owner — never human.
+    const events = ws.plugin.service.repos.readEventsSince(session.sessionId, 0n, 200);
+    const released = [...events].reverse().find((e) => e.type === "lease.released");
+    expect((released?.payload as { owner?: string })?.owner).toBe("agent");
+    // The abandoned candidate is explicitly failed — observable, not ownerless.
+    const candidate = ws.plugin.service.repos.getCandidate(task.candidateId);
+    expect(candidate?.state).toBe("failed");
+    expect(candidate?.failureReason).toContain("session closed");
+  });
+});
+
 describe.skipIf(!engineUp || process.platform !== "win32")(
   "Windows 8.3 short-path hardening (round 8)",
   () => {

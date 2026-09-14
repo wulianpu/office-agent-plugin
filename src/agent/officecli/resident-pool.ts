@@ -16,6 +16,14 @@ interface ResidentEntry {
 
 export class ResidentPool {
   private readonly residents = new Map<string, ResidentEntry>();
+  /**
+   * P1-high (#6): same-file opening single-flight. The pool is the resource
+   * ownership boundary — it must never depend on callers being serialized.
+   * Without this, two concurrent acquire(file) calls each took a governor
+   * lease and each ran adapter.open(); the second Map.set overwrote the
+   * first entry, orphaning its ResourceLease (unreleasable until dispose).
+   */
+  private readonly openings = new Map<string, Promise<ResidentEntry>>();
   private sweeper?: NodeJS.Timeout;
   private sweeping = false;
 
@@ -36,6 +44,19 @@ export class ResidentPool {
       existing.lastUsedAt = Date.now();
       return { file, pool: this, closeOnRelease: false };
     }
+    let opening = this.openings.get(file);
+    if (!opening) {
+      opening = this.openResident(file).finally(() => this.openings.delete(file));
+      this.openings.set(file, opening);
+    }
+    await opening;
+    return { file, pool: this, closeOnRelease: false };
+  }
+
+  /** One governor lease + one adapter.open per file, shared by all joiners;
+   *  on failure the lease is released exactly once and every joiner sees the
+   *  same error with the pool back at baseline. */
+  private async openResident(file: string): Promise<ResidentEntry> {
     const lease = await this.governor.acquire({
       classes: { "native-process": 1, memory: 1 },
       bytes: 32 * 1024 * 1024,
@@ -48,9 +69,10 @@ export class ResidentPool {
       lease.release();
       throw error;
     }
-    this.residents.set(file, { file, lease, lastUsedAt: Date.now() });
+    const entry: ResidentEntry = { file, lease, lastUsedAt: Date.now() };
+    this.residents.set(file, entry);
     this.ensureSweeper();
-    return { file, pool: this, closeOnRelease: false };
+    return entry;
   }
 
   /**

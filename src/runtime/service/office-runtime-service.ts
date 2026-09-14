@@ -474,11 +474,21 @@ export class OfficeRuntimeService {
     }
     this.editorArtifactLeases.get(sessionId)?.release();
     this.editorArtifactLeases.delete(sessionId);
-    const lease = this.leases.releaseForSession(sessionId);
-    if (lease) {
+    // P1-high (#6): endEdit manages the HUMAN editor lifecycle only — an
+    // active AGENT lease is released by AgentRuntime.abortSession with the
+    // true owner recorded in the durable event, never misattributed here.
+    const lease = this.leases.activeLease(sessionId);
+    if (lease && lease.owner !== "human") {
+      this.sessions.updateSession(sessionId, (s) => {
+        s.editor = undefined;
+      });
+      return;
+    }
+    const released = this.leases.releaseForSession(sessionId);
+    if (released) {
       await this.events.emit(sessionId, this.sessions.require(sessionId).sessionEpoch, "lease.released", {
-        leaseId: lease.leaseId,
-        owner: "human"
+        leaseId: released.leaseId,
+        owner: released.owner
       });
     }
     this.sessions.updateSession(sessionId, (s) => {
@@ -635,6 +645,10 @@ export class OfficeRuntimeService {
   // ---- Lifecycle ----
 
   async closeSession(sessionId: string): Promise<void> {
+    // P1-high (#6): reclaim the ACTIVE AGENT task (resident, lease, lane,
+    // candidate) BEFORE any generic cleanup — session close must not leave
+    // ownerless engine residents or misattribute the lease release.
+    await this.agent.abortSession(sessionId, "session-closed").catch(() => undefined);
     await this.endEdit(sessionId).catch(() => undefined);
     const session = this.sessions.get(sessionId);
     if (session) {
