@@ -85,7 +85,12 @@ describe("bench gate provenance enforcement (issue #15, round 25)", () => {
   });
 
   it("no expected SHA provided: local ad-hoc run passes on provenance alone", () => {
-    const r = runGate(report("c0ffee".padEnd(40, "0")), {});
+    // CI sets GITHUB_SHA globally — strip it so the gate truly runs in
+    // no-expected mode (local ad-hoc semantics).
+    const r = runGate(report("c0ffee".padEnd(40, "0")), {
+      GITHUB_SHA: "",
+      BENCH_EXPECTED_COMMIT: ""
+    });
     expect(r.code).toBe(0);
   });
 
