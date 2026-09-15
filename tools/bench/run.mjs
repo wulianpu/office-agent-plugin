@@ -195,7 +195,7 @@ async function benchCandidate(plugin, files) {
   );
 }
 
-async function benchLargeXlsx(plugin) {
+async function benchLargeXlsx(plugin, files) {
   const largePath = join(corpusDir, "xlsx-large.xlsx");
   let s;
   try {
@@ -204,6 +204,28 @@ async function benchLargeXlsx(plugin) {
     verdict("large XLSX bounded viewport (§138)", true, "skipped: xlsx-large.xlsx not in corpus");
     return;
   }
+  // P1 (#15 reopen): COLD measurement — a fresh plugin with an empty cache,
+  // so TTFP/heap reflect the first open of the 73MB workbook, not a
+  // warm-cache hit left over from benchPreview100. The warm number is then
+  // recorded separately on the original shared plugin.
+  const coldWorkspace = await mkdtemp(join(tmpdir(), "office-bench-cold-"));
+  const coldPlugin = await OfficePlugin.create({ workspaceRoot: join(coldWorkspace, "rt") });
+  let cold;
+  try {
+    const coldRef = await coldPlugin.registerArtifact(largePath);
+    const coldHeapBefore = heapMB();
+    const coldStarted = performance.now();
+    const coldPreview = await coldPlugin.preview({ artifactRef: coldRef, priority: "visible" });
+    cold = {
+      ttfpMs: Number((performance.now() - coldStarted).toFixed(0)),
+      heapDeltaMB: Number((heapMB() - coldHeapBefore).toFixed(1)),
+      windowRows: coldPreview.model.outline.kind === "xlsx" ? coldPreview.model.outline.sheets[0]?.window.length ?? 0 : 0
+    };
+  } finally {
+    await coldPlugin.dispose().catch(() => undefined);
+    await rm(coldWorkspace, { recursive: true, force: true }).catch(() => undefined);
+  }
+
   const ref = await plugin.registerArtifact(largePath);
   const heapBefore = heapMB();
   const started = performance.now();
@@ -214,14 +236,19 @@ async function benchLargeXlsx(plugin) {
   const ok = outline.kind === "xlsx" && outline.sheets.length > 0 && outline.sheets[0].window.length <= 60;
   report.metrics.largeXlsx = {
     fileMB: Number((s.size / 1024 / 1024).toFixed(1)),
+    // COLD: first open of the file on a fresh plugin (production first-open
+    // evidence; round 23 review — a warm-cache 0ms was previously reported
+    // as the cold number).
+    coldTtfpMs: cold.ttfpMs,
+    coldHeapDeltaMB: cold.heapDeltaMB,
     ttfpMs: Number(elapsed.toFixed(0)),
     heapDeltaMB: Number(heapUsed.toFixed(1)),
     windowRows: outline.kind === "xlsx" ? outline.sheets[0]?.window.length : 0
   };
   verdict(
     "large XLSX bounded renderer working set (§138, §31)",
-    ok && heapUsed < 150,
-    `${(s.size / 1024 / 1024).toFixed(1)}MB file, TTFP ${elapsed.toFixed(0)}ms, heap delta ${heapUsed.toFixed(1)}MB, window rows ${report.metrics.largeXlsx.windowRows}`
+    ok && heapUsed < 150 && cold.heapDeltaMB < 512,
+    `${(s.size / 1024 / 1024).toFixed(1)}MB file, COLD TTFP ${cold.ttfpMs}ms / heap +${cold.heapDeltaMB}MB, warm TTFP ${elapsed.toFixed(0)}ms / heap +${heapUsed.toFixed(1)}MB, window rows ${report.metrics.largeXlsx.windowRows}`
   );
 }
 
@@ -239,7 +266,7 @@ async function main() {
     await benchOpenClose100(plugin, files);
     await benchPreviewOpenEdit(plugin, files);
     await benchCandidate(plugin, files);
-    await benchLargeXlsx(plugin);
+    await benchLargeXlsx(plugin, files);
   } finally {
     await plugin.dispose();
     await rm(workspace, { recursive: true, force: true }).catch(() => undefined);
@@ -248,10 +275,27 @@ async function main() {
   console.log(`\n${JSON.stringify(report.metrics, null, 2)}`);
   console.log(`\n${report.verdicts.length - failed.length}/${report.verdicts.length} benchmark verdicts passed`);
   // Issue #15: machine-readable artifact for the regression gate + nightly
-  // baseline comparison (verdicts included for traceability).
+  // baseline comparison — includes PROVENANCE (commit/OS/Node/time) so the
+  // evidence traces back to a specific environment (round 23).
+  const { execFileSync } = await import("node:child_process");
+  let commit = null;
+  try {
+    commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  } catch { /* not a git checkout */ }
+  const out = {
+    provenance: {
+      commit,
+      os: `${process.platform}/${process.arch}`,
+      node: process.version,
+      quick,
+      finishedAt: new Date().toISOString()
+    },
+    metrics: report.metrics,
+    verdicts: report.verdicts
+  };
   const { writeFile } = await import("node:fs/promises");
   const outPath = process.env.BENCH_OUT ?? "bench-metrics.json";
-  await writeFile(outPath, JSON.stringify({ metrics: report.metrics, verdicts: report.verdicts }, null, 2));
+  await writeFile(outPath, JSON.stringify(out, null, 2));
   console.log(`bench metrics written to ${outPath}`);
   process.exit(failed.length > 0 ? 1 : 0);
 }

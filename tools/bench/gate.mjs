@@ -29,13 +29,33 @@ const LIMITS = {
   /** ms: p95 candidate→proposal→accept engine round-trip. */
   candidateTtpP95Ms: 120_000,
   /** MB: large-XLSX bounded-viewport heap delta (runaway window). */
-  largeXlsxHeapDeltaMB: 512
+  largeXlsxHeapDeltaMB: 512,
+  /** Round 23: COLD first-open bounds for the 73MB workbook. */
+  largeXlsxColdTtfpMs: 60_000,
+  largeXlsxColdHeapMB: 1024
 };
 
 function fail(metric, detail) {
   console.error(`GATE FAIL: ${metric} — ${detail}`);
   process.exit(1);
 }
+
+/**
+ * P1 (#15 reopen): mandatory-metric fail-closed. Every workload metric in
+ * this list MUST be present and finite in the report — an absent/NaN/
+ * Infinity mandatory metric fails the gate instead of silently skipping
+ * the check (a missing candidate/largeXlsx section previously produced a
+ * green "GATE PASS" with those workloads effectively unexecuted).
+ */
+const MANDATORY = [
+  ["preview", "ttfpMs", "p95", LIMITS.previewTtfpP95Ms],
+  ["preview", "heapGrowthMB", null, LIMITS.previewHeapGrowthMB],
+  ["previewOpenEdit", "tteMs", "p95", LIMITS.previewOpenEditTteP95Ms],
+  ["candidate", "ttpMs", "p95", LIMITS.candidateTtpP95Ms],
+  ["largeXlsx", "coldTtfpMs", null, LIMITS.largeXlsxColdTtfpMs],
+  ["largeXlsx", "coldHeapDeltaMB", null, LIMITS.largeXlsxColdHeapMB],
+  ["largeXlsx", "heapDeltaMB", null, LIMITS.largeXlsxHeapDeltaMB]
+];
 
 const report = JSON.parse(readFileSync(jsonPath, "utf8"));
 const m = report.metrics ?? report;
@@ -45,9 +65,29 @@ if (!m || typeof m !== "object" || Object.keys(m).length === 0) {
 
 const violations = [];
 
-if (m.preview?.ttfpMs?.p95 !== undefined) {
-  const v = m.preview.ttfpMs.p95;
-  if (v > LIMITS.previewTtfpP95Ms) violations.push(["preview.ttfpMs.p95", `${v}ms > ${LIMITS.previewTtfpP95Ms}ms`]);
+function readMetric(section, leaf, nestedKey) {
+  const obj = m[section];
+  if (!obj || typeof obj !== "object") return undefined;
+  if (nestedKey) {
+    const inner = obj[leaf];
+    return inner ? inner[nestedKey] : undefined;
+  }
+  return obj[leaf];
+}
+
+for (const [section, leaf, nestedKey, limit] of MANDATORY) {
+  const path = nestedKey ? `${section}.${leaf}.${nestedKey}` : `${section}.${leaf}`;
+  const v = readMetric(section, leaf, nestedKey);
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    violations.push([path, `mandatory metric missing or non-finite (${String(v)}) — workload must execute`]);
+  }
+}
+
+if (m.preview) {
+  const v = m.preview.ttfpMs?.p95;
+  if (typeof v === "number" && Number.isFinite(v) && v > LIMITS.previewTtfpP95Ms) {
+    violations.push(["preview.ttfpMs.p95", `${v}ms > ${LIMITS.previewTtfpP95Ms}ms`]);
+  }
 }
 if (m.preview?.heapGrowthMB !== undefined) {
   const v = m.preview.heapGrowthMB;
@@ -65,10 +105,18 @@ if (m.largeXlsx?.heapDeltaMB !== undefined) {
   const v = m.largeXlsx.heapDeltaMB;
   if (v > LIMITS.largeXlsxHeapDeltaMB) violations.push(["largeXlsx.heapDeltaMB", `${v}MB > ${LIMITS.largeXlsxHeapDeltaMB}MB`]);
 }
+if (m.largeXlsx?.coldTtfpMs !== undefined) {
+  const v = m.largeXlsx.coldTtfpMs;
+  if (v > LIMITS.largeXlsxColdTtfpMs) violations.push(["largeXlsx.coldTtfpMs", `${v}ms > ${LIMITS.largeXlsxColdTtfpMs}ms`]);
+}
+if (m.largeXlsx?.coldHeapDeltaMB !== undefined) {
+  const v = m.largeXlsx.coldHeapDeltaMB;
+  if (v > LIMITS.largeXlsxColdHeapMB) violations.push(["largeXlsx.coldHeapDeltaMB", `${v}MB > ${LIMITS.largeXlsxColdHeapMB}MB`]);
+}
 
 if (violations.length > 0) {
   for (const [metric, detail] of violations) console.error(`GATE FAIL: ${metric} — ${detail}`);
   process.exit(1);
 }
 
-console.log("GATE PASS: all hard smoke limits satisfied");
+console.log("GATE PASS: all mandatory metrics present, finite, and within hard limits");
