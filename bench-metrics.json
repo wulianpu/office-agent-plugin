@@ -1,0 +1,72 @@
+{
+  "metrics": {
+    "preview": {
+      "iterations": 100,
+      "ttfpMs": {
+        "median": 0.15189999999984138,
+        "p95": 2.1485999999999876,
+        "max": 1283.1770000000001
+      },
+      "cacheHits": 94,
+      "heapGrowthMB": 6.3,
+      "rssGrowthMB": 4
+    },
+    "openClose": {
+      "iterations": 100,
+      "openMs": {
+        "median": 1.8454000000001543,
+        "p95": 2.6424999999999272
+      },
+      "retainedHeapMB": 17.3
+    },
+    "previewOpenEdit": {
+      "iterations": 50,
+      "tteMs": {
+        "median": 8.235299999999825,
+        "p95": 11.840599999999995
+      },
+      "timingDriftMs": 1.82,
+      "heapRetainedMB": 16.5
+    },
+    "candidate": {
+      "iterations": 8,
+      "ttpMs": {
+        "median": 11750.261299999998,
+        "p95": 15034.080999999998
+      }
+    },
+    "largeXlsx": {
+      "fileMB": 73.3,
+      "ttfpMs": 0,
+      "heapDeltaMB": 0,
+      "windowRows": 40
+    }
+  },
+  "verdicts": [
+    {
+      "name": "preview-100 memory bounded (§134)",
+      "pass": true,
+      "detail": "100 previews, heap +6.3MB, rss +4.0MB, median TTFP 0ms"
+    },
+    {
+      "name": "open/close x100: retained memory plateau (§135)",
+      "pass": true,
+      "detail": "100 cycles, retained 17.3MB (baseline 21.6MB, growth -4.3MB), median open 1.8ms"
+    },
+    {
+      "name": "preview→open→edit cycles: bounded TTE + no timing drift (§136)",
+      "pass": true,
+      "detail": "50 cycles, median TTE 8.2ms, p95 11.8ms, drift 1.8ms"
+    },
+    {
+      "name": "candidate→proposal→accept (§137)",
+      "pass": true,
+      "detail": "8 engine round-trips (release-gate count TBD), median 11750ms, p95 15034ms"
+    },
+    {
+      "name": "large XLSX bounded renderer working set (§138, §31)",
+      "pass": true,
+      "detail": "73.3MB file, TTFP 0ms, heap delta 0.0MB, window rows 40"
+    }
+  ]
+}
