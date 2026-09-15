@@ -58,6 +58,20 @@ const MANDATORY = [
 ];
 
 const report = JSON.parse(readFileSync(jsonPath, "utf8"));
+
+// P1 (#15 round 24): provenance enforcement — when an EXPECTED candidate
+// SHA is provided (BENCH_EXPECTED_COMMIT / GITHUB_SHA), the report's
+// commit must match it exactly; a report produced from mismatched or
+// dirty-tree code is not release evidence.
+const prov = report.provenance ?? {};
+const expected = process.env.BENCH_EXPECTED_COMMIT ?? process.env.GITHUB_SHA;
+if (expected && prov.commit !== expected) {
+  console.error(
+    `GATE FAIL: provenance commit mismatch — report from ${prov.commit ?? "?"}, expected ${expected}`
+  );
+  process.exit(1);
+}
+
 const m = report.metrics ?? report;
 if (!m || typeof m !== "object" || Object.keys(m).length === 0) {
   fail("bench-report", "no metrics in report — check bench wiring");
