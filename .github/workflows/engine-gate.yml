@@ -1,0 +1,80 @@
+# Production Readiness Gate — engine-backed required lane (issue #15 P1-high-1)
+#
+# This lane is REQUIRED and engine-positive: it must PROVE that a pinned
+# OfficeCLI is installed, probed, and that the engine-backed Agent suite
+# actually EXECUTED (executed count > 0). Unlike the hermetic lanes, no
+# step here may self-skip on missing engine — a missing engine is RED.
+name: engine-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Keep the job/context names stable: the main-required-ci-gate ruleset may
+# be extended to require this context once the lane is proven stable.
+
+jobs:
+  engine:
+    runs-on: windows-latest
+    env:
+      OFFICECLI_PIN: "1.0.150"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      # Pinned, REQUIRED install: failure is red (no continue-on-error).
+      - name: Install OfficeCLI (pinned ${{ env.OFFICECLI_PIN }})
+        run: npm install -g @officecli/officecli@${{ env.OFFICECLI_PIN }}
+
+      # REQUIRED probe: record the version into the log AND an artifact;
+      # a failed probe fails the job. `officecli --version` must run.
+      - name: Probe OfficeCLI
+        shell: pwsh
+        run: |
+          $v = officecli --version
+          if ($LASTEXITCODE -ne 0) { throw "officecli probe failed (exit $LASTEXITCODE)" }
+          "officecli $v" | Out-File -FilePath officecli-version.txt -Encoding utf8
+          Get-Content officecli-version.txt
+          "officecli=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install
+        run: npm ci
+      - name: Build vendor bundles
+        run: npm run build:vendor
+      - name: Build dist
+        run: npx tsc -p tsconfig.json
+      - name: Check (src + tests)
+        run: npm run check
+
+      # Engine-backed integration: hermetic-only environments self-skip, so
+      # here the engine is guaranteed — any skip of the core Agent suites
+      # fails the gate via the executed-count guard script below.
+      - name: Engine-backed integration (Agent/resident/restart)
+        run: npx vitest run test/integration/agent-write-path.test.ts test/integration/lease-fencing.test.ts test/integration/process-restart.test.ts test/integration/candidate-safety.test.ts --reporter=junit --outputFile.junit=test-results/engine-junit.xml
+
+      # Guard: parse the JUnit report and require executed > 0 for the core
+      # engine suites. A green run where everything skipped is a failure.
+      - name: Verify engine tests actually executed
+        shell: pwsh
+        run: |
+          [xml]$xml = Get-Content test-results/engine-junit.xml
+          $total = 0; $executed = 0
+          foreach ($suite in $xml.testsuites.testsuite) {
+            $total += [int]$suite.tests
+            $executed += [int]$suite.tests - [int]$suite.skipped
+          }
+          "engine tests total=$total executed=$executed"
+          if ($total -le 0) { throw "no engine tests collected" }
+          if ($executed -le 0) { throw "all engine tests skipped — engine path NOT verified" }
+
+      - name: Upload engine gate results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine-gate-results
+          path: |
+            test-results/
+            officecli-version.txt
