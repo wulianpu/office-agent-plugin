@@ -274,17 +274,29 @@ async function main() {
   const failed = report.verdicts.filter((v) => !v.pass);
   console.log(`\n${JSON.stringify(report.metrics, null, 2)}`);
   console.log(`\n${report.verdicts.length - failed.length}/${report.verdicts.length} benchmark verdicts passed`);
-  // Issue #15: machine-readable artifact for the regression gate + nightly
-  // baseline comparison — includes PROVENANCE (commit/OS/Node/time) so the
-  // evidence traces back to a specific environment (round 23).
+  // Issue #15 (round 24): provenance hardening — the report must prove
+  // WHICH code produced it. Records HEAD, whether the working tree was
+  // clean, and any EXPECTED candidate SHA (BENCH_EXPECTED_COMMIT or
+  // GITHUB_SHA); gate.mjs refuses mismatched/dirty provenance as release
+  // evidence. Also captures the engine/vendor identity via env (populated
+  // by the engine-gate workflow) when available.
   const { execFileSync } = await import("node:child_process");
   let commit = null;
+  let worktreeClean = null;
   try {
     commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const status = execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" });
+    worktreeClean = status.trim().length === 0;
   } catch { /* not a git checkout */ }
+  const expectedCommit = process.env.BENCH_EXPECTED_COMMIT ?? process.env.GITHUB_SHA ?? null;
   const out = {
     provenance: {
       commit,
+      worktreeClean,
+      commitMatchesExpected: expectedCommit ? commit === expectedCommit : null,
+      expectedCommit,
+      officecli: process.env.OFFICECLI_VERSION ?? null,
+      genoffice: process.env.GENOFFICE_VERSION ?? null,
       os: `${process.platform}/${process.arch}`,
       node: process.version,
       quick,
