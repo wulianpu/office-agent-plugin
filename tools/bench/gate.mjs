@@ -59,17 +59,32 @@ const MANDATORY = [
 
 const report = JSON.parse(readFileSync(jsonPath, "utf8"));
 
-// P1 (#15 round 24): provenance enforcement — when an EXPECTED candidate
-// SHA is provided (BENCH_EXPECTED_COMMIT / GITHUB_SHA), the report's
-// commit must match it exactly; a report produced from mismatched or
-// dirty-tree code is not release evidence.
+// P1 (#15, round 25): provenance enforcement.
+//  - expected-SHA mode (BENCH_EXPECTED_COMMIT / GITHUB_SHA present): the
+//    report commit must MATCH and the producing worktree must have been
+//    CLEAN — a dirty tree means the executed bytes were not the candidate
+//    bytes even when HEAD === expected.
+//  - expected-SHA absent: local ad-hoc run — provenance is still recorded
+//    but the report is NOT release evidence (RELEASE.md §1).
 const prov = report.provenance ?? {};
 const expected = process.env.BENCH_EXPECTED_COMMIT ?? process.env.GITHUB_SHA;
-if (expected && prov.commit !== expected) {
-  console.error(
-    `GATE FAIL: provenance commit mismatch — report from ${prov.commit ?? "?"}, expected ${expected}`
-  );
-  process.exit(1);
+if (expected) {
+  if (prov.commit !== expected) {
+    console.error(
+      `GATE FAIL: provenance commit mismatch — report from ${prov.commit ?? "?"}, expected ${expected}`
+    );
+    process.exit(1);
+  }
+  if (prov.worktreeClean !== true) {
+    console.error(
+      "GATE FAIL: provenance worktreeClean is not true — the benchmark executed against uncommitted changes and cannot serve as release evidence"
+    );
+    process.exit(1);
+  }
+  if (prov.commitMatchesExpected !== true) {
+    console.error("GATE FAIL: provenance commitMatchesExpected is not true");
+    process.exit(1);
+  }
 }
 
 const m = report.metrics ?? report;
