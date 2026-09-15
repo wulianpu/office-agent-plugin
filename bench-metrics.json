@@ -1,42 +1,51 @@
 {
+  "provenance": {
+    "commit": "eb303b1acee1dcb535e2c4bc2ce5f1e237fdce41",
+    "os": "win32/x64",
+    "node": "v24.20.0",
+    "quick": false,
+    "finishedAt": "2026-09-15T18:40:57.581Z"
+  },
   "metrics": {
     "preview": {
       "iterations": 100,
       "ttfpMs": {
-        "median": 0.15189999999984138,
-        "p95": 2.1485999999999876,
-        "max": 1283.1770000000001
+        "median": 0.09189999999989595,
+        "p95": 1.4986999999999853,
+        "max": 1027.7096
       },
       "cacheHits": 94,
-      "heapGrowthMB": 6.3,
-      "rssGrowthMB": 4
+      "heapGrowthMB": 6.4,
+      "rssGrowthMB": 4.2
     },
     "openClose": {
       "iterations": 100,
       "openMs": {
-        "median": 1.8454000000001543,
-        "p95": 2.6424999999999272
+        "median": 1.1688999999998941,
+        "p95": 1.473600000000033
       },
       "retainedHeapMB": 17.3
     },
     "previewOpenEdit": {
       "iterations": 50,
       "tteMs": {
-        "median": 8.235299999999825,
-        "p95": 11.840599999999995
+        "median": 4.081900000000132,
+        "p95": 6.834599999999909
       },
-      "timingDriftMs": 1.82,
-      "heapRetainedMB": 16.5
+      "timingDriftMs": 1.01,
+      "heapRetainedMB": 16.6
     },
     "candidate": {
       "iterations": 8,
       "ttpMs": {
-        "median": 11750.261299999998,
-        "p95": 15034.080999999998
+        "median": 10517.3537,
+        "p95": 10759.0032
       }
     },
     "largeXlsx": {
       "fileMB": 73.3,
+      "coldTtfpMs": 1053,
+      "coldHeapDeltaMB": 0.4,
       "ttfpMs": 0,
       "heapDeltaMB": 0,
       "windowRows": 40
@@ -46,27 +55,27 @@
     {
       "name": "preview-100 memory bounded (§134)",
       "pass": true,
-      "detail": "100 previews, heap +6.3MB, rss +4.0MB, median TTFP 0ms"
+      "detail": "100 previews, heap +6.4MB, rss +4.2MB, median TTFP 0ms"
     },
     {
       "name": "open/close x100: retained memory plateau (§135)",
       "pass": true,
-      "detail": "100 cycles, retained 17.3MB (baseline 21.6MB, growth -4.3MB), median open 1.8ms"
+      "detail": "100 cycles, retained 17.3MB (baseline 21.7MB, growth -4.3MB), median open 1.2ms"
     },
     {
       "name": "preview→open→edit cycles: bounded TTE + no timing drift (§136)",
       "pass": true,
-      "detail": "50 cycles, median TTE 8.2ms, p95 11.8ms, drift 1.8ms"
+      "detail": "50 cycles, median TTE 4.1ms, p95 6.8ms, drift 1.0ms"
     },
     {
       "name": "candidate→proposal→accept (§137)",
       "pass": true,
-      "detail": "8 engine round-trips (release-gate count TBD), median 11750ms, p95 15034ms"
+      "detail": "8 engine round-trips (release-gate count TBD), median 10517ms, p95 10759ms"
     },
     {
       "name": "large XLSX bounded renderer working set (§138, §31)",
       "pass": true,
-      "detail": "73.3MB file, TTFP 0ms, heap delta 0.0MB, window rows 40"
+      "detail": "73.3MB file, COLD TTFP 1053ms / heap +0.4MB, warm TTFP 0ms / heap +0.0MB, window rows 40"
     }
   ]
 }
