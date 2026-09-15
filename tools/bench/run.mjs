@@ -247,6 +247,12 @@ async function main() {
   const failed = report.verdicts.filter((v) => !v.pass);
   console.log(`\n${JSON.stringify(report.metrics, null, 2)}`);
   console.log(`\n${report.verdicts.length - failed.length}/${report.verdicts.length} benchmark verdicts passed`);
+  // Issue #15: machine-readable artifact for the regression gate + nightly
+  // baseline comparison (verdicts included for traceability).
+  const { writeFile } = await import("node:fs/promises");
+  const outPath = process.env.BENCH_OUT ?? "bench-metrics.json";
+  await writeFile(outPath, JSON.stringify({ metrics: report.metrics, verdicts: report.verdicts }, null, 2));
+  console.log(`bench metrics written to ${outPath}`);
   process.exit(failed.length > 0 ? 1 : 0);
 }
 
