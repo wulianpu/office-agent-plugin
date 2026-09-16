@@ -61,20 +61,26 @@ jobs:
       - name: Engine-backed integration (Agent/resident/restart)
         run: npx vitest run test/integration/agent-write-path.test.ts test/integration/lease-fencing.test.ts test/integration/process-restart.test.ts test/integration/candidate-safety.test.ts --reporter=junit --outputFile.junit=test-results/engine-junit.xml
 
-      # Guard: parse the JUnit report and require executed > 0 for the core
-      # engine suites. A green run where everything skipped is a failure.
-      - name: Verify engine tests actually executed
+      # Guard (issue #15 round 26): per-suite executed>0 for the CORE engine
+      # suites — aggregate executed>0 is not enough, because a probe/shim
+      # mismatch could skip all real engine suites while lease-fencing still
+      # runs non-engine fencing tests and keeps the aggregate green.
+      - name: Verify core engine suites actually executed (per-suite)
         shell: pwsh
         run: |
           [xml]$xml = Get-Content test-results/engine-junit.xml
-          $total = 0; $executed = 0
-          foreach ($suite in $xml.testsuites.testsuite) {
-            $total += [int]$suite.tests
-            $executed += [int]$suite.tests - [int]$suite.skipped
+          $required = @('agent-write-path','lease-fencing','process-restart','candidate-safety')
+          $failed = @()
+          foreach ($req in $required) {
+            $suite = $xml.testsuites.testsuite | Where-Object { $_.name -like ('*' + $req + '*') }
+            if (-not $suite) { $failed += ("missing suite: " + $req); continue }
+            $tests = [int]$suite.tests
+            $skipped = [int]$suite.skipped
+            $executed = $tests - $skipped
+            "suite ${req}: tests=$tests skipped=$skipped executed=$executed"
+            if ($tests -le 0 -or $executed -le 0) { $failed += ("suite not executed: " + $req) }
           }
-          "engine tests total=$total executed=$executed"
-          if ($total -le 0) { throw "no engine tests collected" }
-          if ($executed -le 0) { throw "all engine tests skipped — engine path NOT verified" }
+          if ($failed.Count -gt 0) { throw ($failed -join '; ') }
 
       - name: Upload engine gate results
         if: always()
