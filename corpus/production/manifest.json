@@ -14,39 +14,6 @@
       ],
       "sha256": "f91a50609f6d155415585d8240abd8209485cc3d1b5909087c29f18381ce3947",
       "expect": "full"
-    },
-    {
-      "file": "engine-docx.docx",
-      "producer": "officecli",
-      "origin": "engine-generated",
-      "features": [
-        "paragraphs",
-        "styles"
-      ],
-      "sha256": "97092180328770f9aa6b92004c75dce0e340bdde2527743f63acdb456eac021c",
-      "expect": "full"
-    },
-    {
-      "file": "engine-pptx.pptx",
-      "producer": "officecli",
-      "origin": "engine-generated",
-      "features": [
-        "slides",
-        "shapes"
-      ],
-      "sha256": "d5fbfafdbbc2d0a2e123020d1f410ce47e09f59d871b5f6f65b280d8c4e6d705",
-      "expect": "full"
-    },
-    {
-      "file": "engine-xlsx.xlsx",
-      "producer": "officecli",
-      "origin": "engine-generated",
-      "features": [
-        "sheets",
-        "cells"
-      ],
-      "sha256": "c5f8447c47ae7fd6554d44f18046c96b4d11aa20ba82668a4dffd63a29b1c773",
-      "expect": "full"
     }
   ]
 }
