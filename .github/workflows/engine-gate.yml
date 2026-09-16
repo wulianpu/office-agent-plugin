@@ -10,6 +10,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # Keep the job/context names stable: the main-required-ci-gate ruleset may
 # be extended to require this context once the lane is proven stable.
