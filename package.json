@@ -27,6 +27,7 @@
     "soak": "node tools/soak/run.mjs",
     "soak:engine": "node tools/soak/run-engine.mjs",
     "corpus": "node tools/corpus/generate.mjs",
+    "corpus:reopen": "node tools/corpus/external-reopen-validate.mjs",
     "demo": "npm run build && node dist/cli/main.js",
     "build:vendor": "node tools/vendor/build-vendor.mjs",
     "sidecar:build": "node tools/vendor/build-sidecar.mjs",
