@@ -13,5 +13,5 @@ host-slide.png
 slide1-preview.svg
 # CI/junit + compat evidence artifacts (uploaded, never committed)
 test-results/
-# Release candidate packaging output
-release/
+# Release candidate packaging output (root only — NOT tools/release/)
+/release/
