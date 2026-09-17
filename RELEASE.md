@@ -39,6 +39,12 @@ officecli --version > release/officecli-version.txt
 `release/` then contains the immutable artifact, its SHA-256, and the exact
 Node/OfficeCLI versions — attach all three to the release record.
 
+The package `files` whitelist enforces the runtime-only contents
+(`dist/` + `vendor-bundle/` + `README.md`); a full-repo pack (src/test/corpus
+inside the artifact) is a release-blocking defect. Install rehearsal before
+any RC announcement: `npm install <tgz> --omit=dev` into a clean prefix, then
+import `OfficePlugin` from the installed tree and create/dispose one instance.
+
 ## 3. Install / upgrade / rollback
 
 **Fresh install**: unpack artifact → `npm ci --omit=dev` against it → point

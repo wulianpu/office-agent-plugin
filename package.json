@@ -17,6 +17,11 @@
     ".": "./dist/plugin/office-plugin.js",
     "./contracts": "./dist/contracts/index.js"
   },
+  "files": [
+    "dist",
+    "vendor-bundle",
+    "README.md"
+  ],
   "scripts": {
     "build": "npm run build:vendor && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.check.json --noEmit",
