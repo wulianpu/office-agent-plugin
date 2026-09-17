@@ -45,6 +45,14 @@ inside the artifact) is a release-blocking defect. Install rehearsal before
 any RC announcement: `npm install <tgz> --omit=dev` into a clean prefix, then
 import `OfficePlugin` from the installed tree and create/dispose one instance.
 
+`npm run rc:cut` mechanizes §2/§3 end to end and fails closed: preconditions
+(clean worktree, `ci` + `engine-gate` green at HEAD, optional
+`--soak-report <path>` requiring a PASSED soak with Runtime source identical
+to HEAD), pack + SHA256 + version records, then fresh-install / upgrade /
+rollback rehearsals in child processes (the open session must resolve
+recovered→ready after artifact replacement and after backup restore). It
+writes `release/rc-evidence.json`; it never publishes.
+
 ## 3. Install / upgrade / rollback
 
 **Fresh install**: unpack artifact → `npm ci --omit=dev` against it → point
