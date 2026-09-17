@@ -22,6 +22,54 @@ export interface OfficeCliJson {
   data?: unknown;
   message?: string;
   error?: { error: string; code?: string; suggestion?: string };
+  warnings?: Array<{ message?: string; code?: string }>;
+}
+
+/** One engine validate finding (schema message + optional element path/part). */
+export interface ValidationFinding {
+  schema: string;
+  path?: string;
+  part?: string;
+}
+
+export interface ValidationOutcome {
+  passed: boolean;
+  message: string;
+  findings: ValidationFinding[];
+}
+
+export function findingSignature(finding: ValidationFinding): string {
+  return JSON.stringify([finding.schema, finding.path ?? "", finding.part ?? ""]);
+}
+
+/**
+ * The engine reports validate findings as warning triplets — "[Schema] …",
+ * "Path: …", "Part: …" — after a "Found N validation error(s):" header, and
+ * leaves the top-level message EMPTY on failure. Without this parse the
+ * actual findings are lost (production round 30: real WPS files fail with
+ * message:"" and no diagnosability).
+ */
+export function parseValidationFindings(
+  warnings: Array<{ message?: string; code?: string }> | undefined
+): ValidationFinding[] {
+  const findings: ValidationFinding[] = [];
+  let current: ValidationFinding | undefined;
+  for (const warning of warnings ?? []) {
+    const text = typeof warning?.message === "string" ? warning.message : "";
+    if (text.length === 0 || /^Found \d+ validation error/.test(text)) continue;
+    if (text.startsWith("[Schema]")) {
+      current = { schema: text };
+      findings.push(current);
+    } else if (text.startsWith("Path:") && current) {
+      current.path = text.slice("Path:".length).trim();
+    } else if (text.startsWith("Part:") && current) {
+      current.part = text.slice("Part:".length).trim();
+    } else {
+      current = { schema: text };
+      findings.push(current);
+    }
+  }
+  return findings;
 }
 
 export class OfficeCliError extends Error {
@@ -100,13 +148,30 @@ export class OfficeCliAdapter {
     return json.data;
   }
 
-  async validate(file: string): Promise<{ passed: boolean; message: string }> {
-    const json = await this.exec(["validate", this.canonFile(file), "--json"]);
+  async validate(file: string): Promise<ValidationOutcome> {
+    let json: OfficeCliJson;
+    try {
+      json = await this.exec(["validate", this.canonFile(file), "--json"]);
+    } catch (error) {
+      // The engine reports validation FINDINGS as exit 1 + a structured JSON
+      // body (success:false, warnings[]), which exec surfaces as
+      // OfficeCliError. Recover the findings here — only infrastructure
+      // failures (timeout/spawn/non-JSON) propagate as errors.
+      if (error instanceof OfficeCliError && error.stdout) {
+        const parsed = this.parseJson(error.stdout);
+        if (parsed) {
+          await this.releaseAutoResident(file);
+          const message = typeof parsed.data === "string" ? parsed.data : (parsed.message ?? "");
+          return { passed: false, message, findings: parseValidationFindings(parsed.warnings) };
+        }
+      }
+      throw error;
+    }
     await this.releaseAutoResident(file);
     const message = typeof json.data === "string" ? json.data : (json.message ?? "");
     // officecli signals validation failure with success:false + nonzero exit;
     // the message text itself may contain the word "errors" on the PASS path.
-    return { passed: json.success, message };
+    return { passed: json.success, message, findings: parseValidationFindings(json.warnings) };
   }
 
   /**

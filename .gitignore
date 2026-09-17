@@ -11,3 +11,5 @@ vendor-bundle/*.mjs.map
 # Scratch outputs
 host-slide.png
 slide1-preview.svg
+# CI/junit + compat evidence artifacts (uploaded, never committed)
+test-results/
