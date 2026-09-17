@@ -24,6 +24,8 @@
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
     "bench": "npm run build && node tools/bench/run.mjs",
+    "soak": "node tools/soak/run.mjs",
+    "soak:engine": "node tools/soak/run-engine.mjs",
     "corpus": "node tools/corpus/generate.mjs",
     "demo": "npm run build && node dist/cli/main.js",
     "build:vendor": "node tools/vendor/build-vendor.mjs",
