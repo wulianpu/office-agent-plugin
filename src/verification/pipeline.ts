@@ -15,7 +15,8 @@ import { diffPackages } from "./package-diff.js";
 import { readZipEntry, readZipIndex } from "../artifact/scanner/zip.js";
 import type { ArtifactScanner } from "../artifact/scanner/scanner.js";
 import type { ArtifactStore } from "../artifact/store/artifact-store.js";
-import type { OfficeCliAdapter } from "../agent/officecli/officecli-adapter.js";
+import { findingSignature } from "../agent/officecli/officecli-adapter.js";
+import type { OfficeCliAdapter, ValidationFinding } from "../agent/officecli/officecli-adapter.js";
 import type { Scheduler } from "../runtime/scheduler/scheduler.js";
 import type { CommittedRevision } from "../contracts/revision.js";
 
@@ -65,7 +66,7 @@ export class VerificationPipeline {
 
           const l0 = await this.checkL0(scan);
           const l1 = request.engineAvailable
-            ? await this.checkL1(candidatePath)
+            ? await this.checkL1(candidatePath, request.baseRevision)
             : skipped("L1-ooxml-structural", "officecli engine unavailable");
           const l4 = await this.checkL4(request, candidatePath);
           const l3 = request.engineAvailable
@@ -133,19 +134,64 @@ export class VerificationPipeline {
   }
 
   /** L1/L3: OfficeCLI structural validation. */
-  private async checkL1(candidatePath: string): Promise<CheckResult> {
+  private async checkL1(candidatePath: string, baseRevision?: CommittedRevision): Promise<CheckResult> {
     const started = Date.now();
     try {
       const result = await this.deps.adapter.validate(candidatePath);
       if (result.passed) return pass("L1-ooxml-structural", started);
+      // Real producers (WPS/Office) emit schema-quirky-but-openable files.
+      // The candidate lives on a STAGING clone, so the base revision's bytes
+      // are still intact at the live path: findings present identically in
+      // the base are inherited producer quirks (recorded, not blocking);
+      // the gate fails closed only against what the MUTATION added.
+      const newFindings = await this.findingsNewSinceBase(result.findings, baseRevision);
+      if (newFindings.length === 0) {
+        return {
+          layer: "L1-ooxml-structural",
+          status: "warn",
+          durationMs: Date.now() - started,
+          issues: result.findings.map((finding) => ({
+            severity: "warn" as const,
+            code: "inherited-schema-quirk",
+            message: finding.schema,
+            target: finding.part ?? finding.path
+          }))
+        };
+      }
       return fail("L1-ooxml-structural", started, [
-        { severity: "error", code: "schema-invalid", message: result.message }
+        {
+          severity: "error",
+          code: "schema-invalid",
+          message:
+            result.message ||
+            `${newFindings.length} new schema finding(s) not present in the base revision`
+        },
+        ...newFindings.slice(0, 20).map((finding) => ({
+          severity: "error" as const,
+          code: "schema-invalid",
+          message: `${finding.schema}${finding.part ? ` (${finding.part})` : ""}`,
+          target: finding.path
+        }))
       ]);
     } catch (error) {
       return fail("L1-ooxml-structural", started, [
         { severity: "error", code: "engine-error", message: String(error) }
       ]);
     }
+  }
+
+  /** Findings in the candidate list that the base revision does not share. */
+  private async findingsNewSinceBase(
+    findings: ValidationFinding[],
+    baseRevision?: CommittedRevision
+  ): Promise<ValidationFinding[]> {
+    if (findings.length === 0) return [];
+    if (!baseRevision) return findings;
+    // Base unresolvable → fail-closed: every finding is treated as new.
+    const basePath = this.deps.store.resolvePath(baseRevision.artifactRef);
+    const base = await this.deps.adapter.validate(basePath);
+    const inherited = new Set(base.findings.map(findingSignature));
+    return findings.filter((finding) => !inherited.has(findingSignature(finding)));
   }
 
   /**

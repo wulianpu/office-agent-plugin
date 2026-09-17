@@ -58,8 +58,10 @@ jobs:
       # Engine-backed integration: hermetic-only environments self-skip, so
       # here the engine is guaranteed — any skip of the core Agent suites
       # fails the gate via the executed-count guard script below.
-      - name: Engine-backed integration (Agent/resident/restart)
-        run: npx vitest run test/integration/agent-write-path.test.ts test/integration/lease-fencing.test.ts test/integration/process-restart.test.ts test/integration/candidate-safety.test.ts --reporter=junit --outputFile.junit=test-results/engine-junit.xml
+      # production-compat (issue #15 round 30): the REAL corpus must go
+      # through the Agent write path + cold restart + external reopen here.
+      - name: Engine-backed integration (Agent/resident/restart/production corpus)
+        run: npx vitest run test/integration/agent-write-path.test.ts test/integration/lease-fencing.test.ts test/integration/process-restart.test.ts test/integration/candidate-safety.test.ts test/integration/production-compat.test.ts --reporter=junit --outputFile.junit=test-results/engine-junit.xml
 
       # Guard (issue #15 round 26): per-suite executed>0 for the CORE engine
       # suites — aggregate executed>0 is not enough, because a probe/shim
@@ -69,7 +71,7 @@ jobs:
         shell: pwsh
         run: |
           [xml]$xml = Get-Content test-results/engine-junit.xml
-          $required = @('agent-write-path','lease-fencing','process-restart','candidate-safety')
+          $required = @('agent-write-path','lease-fencing','process-restart','candidate-safety','production-compat')
           $failed = @()
           foreach ($req in $required) {
             $suite = $xml.testsuites.testsuite | Where-Object { $_.name -like ('*' + $req + '*') }
