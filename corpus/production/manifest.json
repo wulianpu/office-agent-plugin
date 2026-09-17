@@ -14,6 +14,41 @@
       ],
       "sha256": "f91a50609f6d155415585d8240abd8209485cc3d1b5909087c29f18381ce3947",
       "expect": "full"
+    },
+    {
+      "file": "wps-docx.docx",
+      "producer": "wps",
+      "origin": "wps-suite-synthetic",
+      "features": [
+        "styles",
+        "headings",
+        "tables"
+      ],
+      "sha256": "34feb48fbd1f6b44638008f12ba4ee609cb4e61527aeea98a8975b955d24a5b9",
+      "expect": "full"
+    },
+    {
+      "file": "wps-pptx.pptx",
+      "producer": "wps",
+      "origin": "wps-suite-synthetic",
+      "features": [
+        "slide-master",
+        "placeholders",
+        "multiple-slides"
+      ],
+      "sha256": "c22b00acd9fa709a028b729f2cf3c7cd49f02ccb4f032026a74383d2ba6f9fd2",
+      "expect": "full"
+    },
+    {
+      "file": "wps-xlsx.xlsx",
+      "producer": "wps",
+      "origin": "wps-suite-synthetic",
+      "features": [
+        "formulas",
+        "multiple-sheets"
+      ],
+      "sha256": "18015cd10885ea66fa76dadacbf65b2008a82b6280a8ad28c0cb2fc6d454f706",
+      "expect": "full"
     }
   ]
 }
