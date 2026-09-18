@@ -133,7 +133,7 @@ jobs:
         run: node tools/corpus/generate.mjs
       - name: Benchmark (tools/bench/gate.mjs hard limits)
         run: |
-          rm -f bench-metrics.json
+          node -e "require('fs').rmSync('bench-metrics.json', { force: true })"
           node tools/bench/run.mjs
           node tools/bench/gate.mjs bench-metrics.json
       - name: Upload bench metrics
