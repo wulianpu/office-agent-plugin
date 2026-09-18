@@ -203,6 +203,10 @@ const passed =
   last.engineTasks === 0 &&
   (residentSamples.length === 0 || residents_within_bound());
 
+// Machine-readable pass flag — the rc:cut soak gate requires verdict.passed
+// (schema-valid), not a re-derived weaker heuristic.
+verdict.passed = passed;
+
 function residents_within_bound() {
   // Engine process count must stay bounded — residents must not accumulate
   // across 100+ accept cycles and cold restarts.

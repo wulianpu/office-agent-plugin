@@ -20,6 +20,7 @@
   "files": [
     "dist",
     "vendor-bundle",
+    "release-provenance.json",
     "README.md"
   ],
   "scripts": {
