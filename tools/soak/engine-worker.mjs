@@ -12,7 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const [workerId, cyclesArg, workspaceRoot] = process.argv.slice(2);
+const [workerId, cyclesArg, tmpRoot] = process.argv.slice(2);
+const workspaceRoot = join(tmpRoot, `ws-w${workerId}`);
 const cycles = Number(cyclesArg ?? 100);
 
 const mod = await import(
@@ -22,6 +23,7 @@ const adapterMod = await import(
   pathToFileURL(join(process.cwd(), "dist", "agent", "officecli", "officecli-adapter.js")).href
 );
 
+await (await import("node:fs/promises")).mkdir(workspaceRoot, { recursive: true });
 const engine = new adapterMod.OfficeCliAdapter({ timeoutMs: 120_000 });
 const docx = join(workspaceRoot, `concurrent-w${workerId}.docx`);
 await engine.run(["create", docx, "--json"]).catch(() => undefined);
