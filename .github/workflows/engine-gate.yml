@@ -119,7 +119,7 @@ jobs:
       - name: Long-path TEMP (libuv fs-event 8.3 crash workaround)
         shell: pwsh
         run: |
-          $longTemp = "D:\_longtemp"
+          $longTemp = "D:\a\_longtemp"
           New-Item -ItemType Directory -Force -Path $longTemp | Out-Null
           "TEMP=$longTemp" >> $env:GITHUB_ENV
           "TMP=$longTemp" >> $env:GITHUB_ENV
