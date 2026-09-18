@@ -46,8 +46,13 @@ const osHandles = async (pids) => {
 };
 const rssMB = () => process.memoryUsage().rss / 1024 / 1024;
 
-const workspace = join(await mkdtemp(join(tmpdir(), "soak-concurrent-")), "ws");
-await mkdir(workspace, { recursive: true });
+const tmpRoot = await mkdtemp(join(tmpdir(), "soak-concurrent-"));
+// One workspace root PER WORKER: the RuntimeDatabase is single-owner by
+// design (see src/runtime/persistence/database.ts) — multi-process sharing
+// of one DB is out of contract and the startup reconciliation legitimately
+// reclaims foreign rows. The contended resource under test is the shared
+// engine + machine, not the DB.
+await mkdir(join(tmpRoot, "placeholder"), { recursive: true });
 const baselineRss = rssMB();
 const startedAt = new Date().toISOString();
 console.log(`baseline: RSS ${baselineRss.toFixed(1)} MB, launching ${workers} workers x ${cyclesPerWorker} cycles`);
@@ -55,7 +60,7 @@ console.log(`baseline: RSS ${baselineRss.toFixed(1)} MB, launching ${workers} wo
 const children = [];
 for (let w = 1; w <= workers; w++) {
   children.push(
-    run(process.execPath, [join(process.cwd(), "tools", "soak", "engine-worker.mjs"), String(w), String(cyclesPerWorker), workspace], {
+    run(process.execPath, [join(process.cwd(), "tools", "soak", "engine-worker.mjs"), String(w), String(cyclesPerWorker), tmpRoot], {
       cwd: process.cwd(),
       timeout: 3_600_000,
       maxBuffer: 16 * 1024 * 1024
@@ -85,7 +90,12 @@ const drainRss = rssMB();
 const summaries = [];
 for (const r of settled) {
   if (r.status !== "fulfilled") {
-    summaries.push({ error: String(r.reason).slice(0, 200) });
+    const reason = r.reason ?? {};
+    summaries.push({
+      error: String(reason.message ?? reason).slice(0, 200),
+      workerStderr: String(reason.stderr ?? "").slice(-2000),
+      workerStdoutTail: String(reason.stdout ?? "").slice(-500)
+    });
     continue;
   }
   const line = r.value.stdout.trim().split("\n").find((l) => l.trim().startsWith("{"));
@@ -127,7 +137,7 @@ await writeFile(
   join(process.cwd(), "test-results", "soak-concurrent-report.json"),
   JSON.stringify({ verdict, samples }, null, 2)
 );
-await rm(join(workspace, ".."), { recursive: true, force: true }).catch(() => undefined);
+await rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined);
 console.log(JSON.stringify(verdict));
 console.log(passed ? "CONCURRENT SOAK PASS" : "CONCURRENT SOAK FAIL");
 process.exit(passed ? 0 : 1);
