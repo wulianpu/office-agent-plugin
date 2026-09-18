@@ -15,7 +15,7 @@ linked to that SHA:
 | Windows + Linux correctness CI green | `ci.yml` required checks | Ruleset `main-required-ci-gate` (PR-only, strict) |
 | Engine-backed lane: pinned OfficeCLI installed/probed, Agent suites executed (not skipped) | `engine-gate.yml` artifact `engine-gate-results` | engine-gate job (any skip = red) |
 | OfficeCLI version + compatibility fingerprint | `officecli-version.txt` artifact | engine-gate job |
-| Benchmark metrics JSON (TTFP/TTE/TTP p95, heap, RSS) | `bench-metrics.json` artifact | engine-gate bench step + `tools/bench/gate.mjs` hard limits |
+| Benchmark metrics JSON (TTFP/TTE/TTP p95, heap, RSS) | `bench-metrics.json` artifact (uploaded by the `bench` job) | engine-gate `bench` job + `tools/bench/gate.mjs` hard limits |
 | Production compatibility corpus run (when corpus present) | `production-compat.test.ts` results | suite reports the gap honestly if corpus absent |
 
 The pinned OfficeCLI version lives in `engine-gate.yml` (`OFFICECLI_PIN`).
@@ -45,13 +45,22 @@ inside the artifact) is a release-blocking defect. Install rehearsal before
 any RC announcement: `npm install <tgz> --omit=dev` into a clean prefix, then
 import `OfficePlugin` from the installed tree and create/dispose one instance.
 
-`npm run rc:cut` mechanizes §2/§3 end to end and fails closed: preconditions
-(clean worktree, `ci` + `engine-gate` green at HEAD, optional
-`--soak-report <path>` requiring a PASSED soak with Runtime source identical
-to HEAD), pack + SHA256 + version records, then fresh-install / upgrade /
-rollback rehearsals in child processes (the open session must resolve
-recovered→ready after artifact replacement and after backup restore). It
-writes `release/rc-evidence.json`; it never publishes.
+`npm run rc:cut` mechanizes §2/§3 end to end and fails closed. Preconditions
+(clean worktree; `ci` + `engine-gate` green at HEAD; MANDATORY
+`--soak-report <path>` whose runner verdict is schema-valid `passed: true`
+and whose `sha` EQUALS HEAD exactly — an RC without an exact-SHA PASSED soak
+is not cuttable). The artifact is REBUILT from HEAD, never packed from the
+caller's ignored `dist/`/`vendor-bundle/`: those are deleted, then
+`npm ci → build:vendor → tsc` run in place, and a `release-provenance.json`
+(candidate SHA) is stamped into the package; the install rehearsals assert
+the installed provenance matches the expected commit. A previous artifact is
+built from the last source-touching commit's parent, giving two genuinely
+distinguishable binaries: fresh install uses the previous artifact, upgrade
+must observe the installed dist-tree hash CHANGE (else fail), and rollback
+restores the previous binary AND the matching workspace backup, with the
+dist-tree hash asserted equal again. It writes `release/rc-evidence.json`
+(including provenance domains: package, local engine CLI, required-CI engine
+pin, GenOffice submodule SHA); it never publishes.
 
 ## 3. Install / upgrade / rollback
 
