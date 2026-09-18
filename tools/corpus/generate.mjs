@@ -9,6 +9,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { crc32 } from "node:zlib";
 
@@ -67,7 +68,23 @@ function buildZip(entries) {
   return Buffer.concat([...locals, cdBuf, eocd]);
 }
 
+// Windows: the npm global install only provides a .cmd shim — bare execFile
+// cannot spawn it and shell mode mangles the JSON argv (CI produced 1 of 6
+// corpus files this way). Prefer the dist adapter, which resolves the shim
+// to its JS entry; fall back to bare execFile where dist is absent.
+let adapter;
+try {
+  adapter = new (
+    await import(pathToFileURL(join(process.cwd(), "dist", "agent", "officecli", "officecli-adapter.js")).href)
+  ).OfficeCliAdapter({ timeoutMs: 300_000 });
+} catch {
+  adapter = null;
+}
+
 async function officecli(args, cwd) {
+  if (adapter) {
+    return JSON.stringify(await adapter.run(args));
+  }
   const { stdout } = await run("officecli", args, { cwd, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
   return stdout;
 }
@@ -149,9 +166,11 @@ export async function generateCorpus(targetDir = ".corpus") {
   }
 
   // Large XLSX (§138): rows × 26 cols stored locally — tens of MB, fast.
-  // 90k keeps total XML elements ≈2.4M under the engine's 3,000,000-element
-  // open guard (1.0.151 rejects larger documents), with ~19% margin.
-  const rows = Number(process.env.CORPUS_LARGE_ROWS ?? 90_000);
+  // The engine rejects opens above 3,000,000 XML elements (1.0.151 memory
+  // guard; empirically tripped by the CI resident on larger files). 45k rows
+  // ≈1.2M cells / ~34MB — safely under the guard on every counting basis,
+  // still a tens-of-MB stored workbook. CORPUS_LARGE_ROWS overrides.
+  const rows = Number(process.env.CORPUS_LARGE_ROWS ?? 45_000);
   const large = buildZip([
     { name: "[Content_Types].xml", data: '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>' },
     { name: "xl/workbook.xml", data: '<?xml version="1.0"?><workbook xmlns:r="rel"><sheets><sheet name="Big" sheetId="1" r:id="rId1"/></sheets></workbook>' },
