@@ -16,3 +16,6 @@ test-results/
 # Release candidate packaging output (root only — NOT tools/release/)
 /release/
 /release-provenance.json
+# Local bench output (CI uploads it as an artifact)
+/bench-metrics.json
+/release-provenance.json

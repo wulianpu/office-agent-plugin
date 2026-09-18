@@ -148,8 +148,10 @@ export async function generateCorpus(targetDir = ".corpus") {
     ]));
   }
 
-  // Large XLSX (§138): 100k rows × 26 cols stored locally — tens of MB, fast.
-  const rows = Number(process.env.CORPUS_LARGE_ROWS ?? 100_000);
+  // Large XLSX (§138): rows × 26 cols stored locally — tens of MB, fast.
+  // 90k keeps total XML elements ≈2.4M under the engine's 3,000,000-element
+  // open guard (1.0.151 rejects larger documents), with ~19% margin.
+  const rows = Number(process.env.CORPUS_LARGE_ROWS ?? 90_000);
   const large = buildZip([
     { name: "[Content_Types].xml", data: '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>' },
     { name: "xl/workbook.xml", data: '<?xml version="1.0"?><workbook xmlns:r="rel"><sheets><sheet name="Big" sheetId="1" r:id="rId1"/></sheets></workbook>' },
