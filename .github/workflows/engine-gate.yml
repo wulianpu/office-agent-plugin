@@ -19,7 +19,7 @@ jobs:
   engine:
     runs-on: windows-latest
     env:
-      OFFICECLI_PIN: "1.0.150"
+      OFFICECLI_PIN: "1.0.151"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -91,4 +91,56 @@ jobs:
           name: engine-gate-results
           path: |
             test-results/
+            officecli-version.txt
+
+  # Benchmark hard-limit gate (issue #15 review: RELEASE.md claims a bench
+  # step that did not exist — this job makes that claim true). Machine-
+  # readable bench-metrics.json is uploaded bound to the exact SHA; a gate
+  # violation is RED. Runs on the pinned engine, same as required CI.
+  bench:
+    runs-on: windows-latest
+    env:
+      OFFICECLI_PIN: "1.0.151"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Install OfficeCLI (pinned ${{ env.OFFICECLI_PIN }})
+        run: npm install -g @officecli/officecli@${{ env.OFFICECLI_PIN }}
+      - name: Probe OfficeCLI
+        shell: pwsh
+        run: |
+          $v = officecli --version
+          if ($LASTEXITCODE -ne 0) { throw "officecli probe failed (exit $LASTEXITCODE)" }
+          "OFFICECLI_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Long-path TEMP (libuv fs-event 8.3 crash workaround)
+        shell: pwsh
+        run: |
+          $longTemp = "D:\a\_longtemp"
+          New-Item -ItemType Directory -Force -Path $longTemp | Out-Null
+          "TEMP=$longTemp" >> $env:GITHUB_ENV
+          "TMP=$longTemp" >> $env:GITHUB_ENV
+      - name: Install
+        run: npm ci
+      - name: Build vendor bundles
+        run: npm run build:vendor
+      - name: Build dist
+        run: npx tsc -p tsconfig.json
+      - name: Generate golden corpus (.corpus is gitignored by design)
+        run: node tools/corpus/generate.mjs
+      - name: Benchmark (tools/bench/gate.mjs hard limits)
+        run: |
+          node -e "require('fs').rmSync('bench-metrics.json', { force: true })"
+          node tools/bench/run.mjs
+          node tools/bench/gate.mjs bench-metrics.json
+      - name: Upload bench metrics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-metrics
+          path: |
+            bench-metrics.json
             officecli-version.txt
