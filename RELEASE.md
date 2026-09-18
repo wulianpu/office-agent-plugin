@@ -17,10 +17,22 @@ linked to that SHA:
 | OfficeCLI version + compatibility fingerprint | `officecli-version.txt` artifact | engine-gate job |
 | Benchmark metrics JSON (TTFP/TTE/TTP p95, heap, RSS) | `bench-metrics.json` artifact (uploaded by the `bench` job) | engine-gate `bench` job + `tools/bench/gate.mjs` hard limits |
 | Production compatibility corpus run (when corpus present) | `production-compat.test.ts` results | suite reports the gap honestly if corpus absent |
+| Serial engine soak (multi-hour plateau) | `soak-engine-report.json` (`verdict.passed === true`, exact-SHA) | `rc:cut` soak gate (mandatory) |
+| Concurrent engine workload (queue wait / OS handles / drain) | `soak-concurrent-report.json` (`verdict.passed === true`) | `tools/soak/run-engine-concurrent.mjs` |
+| Benchmark metrics JSON (TTFP/TTE/TTP p95, heap, RSS) | `bench-metrics.json` artifact (uploaded by the `bench` job) | engine-gate `bench` job + `tools/bench/gate.mjs` hard limits |
 
 The pinned OfficeCLI version lives in `engine-gate.yml` (`OFFICECLI_PIN`).
 Upgrading it requires a PR that runs the engine-gate against the new version
 (compatibility matrix) before the pin moves.
+
+## 1b. Immutability policy
+
+Release tags (`v*`) are protected by the `release-tags-immutable` ruleset
+(deletion + non-fast-forward denied, no bypass). Publishing an RC therefore
+means: cut a NEW tag (rc.N+1) rather than moving an existing one, and attach
+artifacts with their SHA256SUMS recorded inside `rc-evidence.json`. The
+RC evidence records provenance domains separately: package version, local
+engine CLI, required-CI engine pin, and the GenOffice submodule SHA.
 
 ## 2. Producing a release artifact
 
