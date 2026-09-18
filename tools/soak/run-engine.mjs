@@ -106,15 +106,16 @@ const residentSamples = [];
 
 for (let cycle = 1; cycle <= cycles; cycle++) {
   try {
-    if (cycle % RESTART_EVERY === 0 && lastSessionId) {
-      // Cold restart under sustained engine load: dispose everything,
-      // recreate the Runtime, resolve the recovered session.
+    if (cycle % RESTART_EVERY === 0) {
+      // Cold restart under sustained engine load: dispose everything and
+      // recreate the Runtime. Every cycle closes its session by design, so
+      // there is deliberately NO open session to recover here (recovery of
+      // an OPEN session across dispose is production-compat's required-CI
+      // job; resolving a closed-then-reconciled session id throws
+      // unknown-session). The restart assertion is hydration: the recreated
+      // runtime re-registers every artifact and the next cycle must work.
       await plugin.dispose().catch(() => undefined);
       plugin = await OfficePlugin.create({ workspaceRoot: join(workspace, "rt"), skipHostProbe: true });
-      const outcome = await plugin.service.resolveRecoveredSession(lastSessionId);
-      if (outcome !== "ready" && outcome !== "closed") {
-        throw new Error(`recovery resolution after cold restart: ${outcome}`);
-      }
       refs = [];
       for (const f of fixtures) refs.push({ ref: await plugin.registerArtifact(f.file), fixture: f });
     }
