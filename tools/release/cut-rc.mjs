@@ -135,7 +135,11 @@ async function packBuilt(name) {
  * provenance, pack. Stale-output reuse is the provenance hole being closed. */
 async function cleanRebuild(name, buildSha) {
   await rm(join(process.cwd(), "dist"), { recursive: true, force: true });
-  await rm(join(process.cwd(), "vendor-bundle"), { recursive: true, force: true });
+  // vendor-bundle contains a TRACKED manifest/package.json next to the
+  // generated bundles — delete only the generated artifacts and restore
+  // tracked state, never the directory wholesale.
+  await rm(join(process.cwd(), "vendor-bundle"), { recursive: true, force: true }).catch(() => undefined);
+  sh("git restore vendor-bundle 2>/dev/null || true");
   await writeFile(
     join(process.cwd(), PROVENANCE_FILE),
     JSON.stringify({ candidateSha: buildSha, builtAt: new Date().toISOString() }, null, 2)
@@ -313,6 +317,8 @@ const evidence = {
     rollback: "pass",
     artifactReplacementVerified: true
   },
+  previousBuildNote:
+    "previous.tgz is an internal upgrade/rollback FIXTURE built from the last source-touching commit's parent; it predates the package files whitelist and is never published", 
   finishedAt: new Date().toISOString()
 };
 await writeFile(join(releaseDir, "rc-evidence.json"), JSON.stringify(evidence, null, 2));
