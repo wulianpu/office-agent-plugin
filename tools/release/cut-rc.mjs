@@ -156,7 +156,6 @@ async function cleanRebuild(name, buildSha) {
 // a genuinely different dist tree, recent enough for schema compatibility.
 const lastSrcCommit = sh(`git log -1 --format=%H -- src/ vendor/`);
 const previousSha = sh(`git rev-parse ${lastSrcCommit}^`);
-const branch = sh("git rev-parse --abbrev-ref HEAD");
 
 await mkdir(releaseDir, { recursive: true });
 for (const stale of await readdir(releaseDir)) await rm(join(releaseDir, stale), { force: true });
@@ -177,7 +176,10 @@ try {
   previous = await packBuilt("previous.tgz");
   console.log(`built: previous.tgz from ${previousSha.slice(0, 12)} (sha256 ${previous.sha256.slice(0, 12)}…)`);
 } finally {
-  sh(`git checkout ${branch}`);
+  // Force-return to the candidate state: the previous build legitimately
+  // leaves tracked-file deletions behind (build:vendor wipes vendor-bundle),
+  // which a plain checkout would refuse.
+  sh(`git checkout -f ${sha}`);
   await rm(join(process.cwd(), PROVENANCE_FILE), { force: true }).catch(() => undefined);
 }
 if (sh("git rev-parse HEAD") !== sha) fail("checkout dance did not return to candidate HEAD");
