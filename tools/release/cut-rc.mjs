@@ -240,6 +240,16 @@ const install = async (artifact, label) => {
   await rm(join(prefix, "node_modules"), { recursive: true, force: true });
   await run("npm", ["install", pathToFileURL(artifact.path).href, "--omit=dev"], { cwd: prefix });
   if (!existsSync(installedEntry)) fail(`${label}: runtime entry missing from the installed tree`);
+  // npm does not reliably materialize the tarball's file: dependency
+  // ("genoffice-vendor": "file:vendor-bundle"). The shipped vendor-bundle IS
+  // that package — materialize it explicitly so bare-specifier imports of
+  // dist/vendor/genoffice/wrapper.js resolve inside the installed tree.
+  const vendored = join(prefix, "node_modules", "genoffice-vendor");
+  await rm(vendored, { recursive: true, force: true });
+  await cp(join(pkgRoot, "vendor-bundle"), vendored, { recursive: true });
+  if (!existsSync(join(vendored, "package.json"))) {
+    fail(`${label}: genoffice-vendor materialization failed`);
+  }
 };
 const phase = async (name, sessionId) => {
   const args = [join(process.cwd(), "tools", "release", "rc-phase.mjs"), name, prefix];
