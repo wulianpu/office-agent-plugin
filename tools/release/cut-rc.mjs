@@ -145,8 +145,9 @@ async function cleanRebuild(name, buildSha) {
     JSON.stringify({ candidateSha: buildSha, builtAt: new Date().toISOString() }, null, 2)
   );
   sh("npm ci"); // hermetic: deps exactly as the committed lockfile says
-  sh("npm run build:vendor");
+  sh("npm run build:vendor"); // regenerates the bundle dir — may drop tracked files
   sh("npx tsc -p tsconfig.json");
+  sh("git restore vendor-bundle 2>/dev/null || true"); // tracked manifest back
   console.log(`rebuilt from ${buildSha.slice(0, 12)} (npm ci + vendor-bundle + tsc)`);
   return packBuilt(name);
 }
