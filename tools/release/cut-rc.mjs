@@ -169,6 +169,13 @@ try {
   // upgrade/rollback fixture — it just has to genuinely differ from HEAD.
   sh("npm run build:vendor");
   sh("npx tsc -p tsconfig.json");
+  // This fixture's source predates the files whitelist — apply the same
+  // whitelist for the pack so the fixture ships its built vendor-bundle
+  // engines too (checkout -f back to the candidate restores package.json).
+  const prevPkgPath = join(process.cwd(), "package.json");
+  const prevPkg = JSON.parse(await readFile(prevPkgPath, "utf8"));
+  prevPkg.files = ["dist", "vendor-bundle", "release-provenance.json", "README.md"];
+  await writeFile(prevPkgPath, JSON.stringify(prevPkg, null, 2) + "\n");
   await writeFile(
     join(process.cwd(), PROVENANCE_FILE),
     JSON.stringify({ candidateSha: previousSha, builtAt: new Date().toISOString() }, null, 2)
