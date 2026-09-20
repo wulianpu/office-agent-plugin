@@ -53,7 +53,7 @@ const run = (cmd, args, opts) =>
   promisify(execFile)(cmd, args, { shell: process.platform === "win32", ...opts });
 const sha256Hex = (data) => createHash("sha256").update(data).digest("hex");
 const sh = (cmd) => execSync(cmd, { cwd: process.cwd(), encoding: "utf8" }).trim();
-const sha = sh("git rev-parse HEAD");
+const sha = arg("candidate-sha") ?? sh("git rev-parse HEAD");
 const PROVENANCE_FILE = "release-provenance.json";
 const nodeExe = process.execPath;
 
@@ -160,7 +160,18 @@ const previousSha = sh(`git rev-parse ${lastSrcCommit}^`);
 await mkdir(releaseDir, { recursive: true });
 for (const stale of await readdir(releaseDir)) await rm(join(releaseDir, stale), { force: true });
 
-const candidate = await cleanRebuild("candidate.tgz", sha);
+// The candidate may differ from HEAD (--candidate-sha): build it in a
+// detached checkout of exactly that SHA, then force-return.
+const startRef = sh("git rev-parse HEAD");
+sh(`git checkout -f --detach ${sha}`);
+let candidate;
+try {
+  candidate = await cleanRebuild("candidate.tgz", sha);
+} finally {
+  sh(`git checkout -f ${startRef}`);
+  await rm(join(process.cwd(), PROVENANCE_FILE), { force: true }).catch(() => undefined);
+}
+if (sh("git rev-parse HEAD") !== startRef) fail("candidate dance did not return to the start ref");
 console.log(`building previous artifact from ${previousSha.slice(0, 12)}…`);
 sh(`git checkout --detach ${previousSha}`);
 let previous;
